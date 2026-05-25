@@ -12,4 +12,3 @@ DEFAULT_MODEL = ""
 DEFAULT_SN = ""
 DEFAULT_WORK_DIR = Path("lrsa_work")
 DEFAULT_STOCK_DIR = Path("tb390fu_dump/stock")
-DEFAULT_EDL = Path("/tmp/edl/edl.py")

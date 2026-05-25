@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, cast
+from urllib.parse import unquote, urlparse
 
 from lrsa.logging import get_logger
 from lrsa.process import command_text
@@ -18,8 +21,18 @@ from .api.client import LRSAClient
 from .api.firmware import response_payload
 from .api.resources import content_list, is_success_payload, resource_summary
 from .auth import extract_token_from_file, save_json
-from .config import DEFAULT_EDL, DEFAULT_MODEL, DEFAULT_SN, DEFAULT_WORK_DIR
-from .device.preflight import find_qualcomm_edl_devices, format_usb_devices
+from .cli import main as run_lrsa_cli
+from .config import DEFAULT_MODEL, DEFAULT_SN, DEFAULT_WORK_DIR
+from .device.preflight import (
+    format_device_states,
+    scan_connected_devices,
+)
+from .flash.software_fix_flow import (
+    is_mobile_or_tablet,
+    prepare_artifacts,
+    resource_filename,
+)
+from .flash.qfil import resolve_qfil_image_dir
 from .menu_constants import (
     BORDER,
     MIN_UI_WIDTH,
@@ -29,24 +42,35 @@ from .menu_constants import (
     UI_WIDTH,
 )
 
-try:
-    from prompt_toolkit.application import Application
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.layout import HSplit, Layout
-    from prompt_toolkit.layout.controls import FormattedTextControl
-    from prompt_toolkit.layout.containers import Window
-    from prompt_toolkit.shortcuts import input_dialog, message_dialog
-    from prompt_toolkit.styles import Style
-except ImportError:  # pragma: no cover - exercised only without optional UI deps.
-    Application = None
-    FormattedTextControl = None
-    HSplit = None
-    KeyBindings = None
-    Layout = None
-    Window = None
-    input_dialog = None
-    message_dialog = None
-    Style = None
+from prompt_toolkit.application import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import HSplit, Layout
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.mouse_events import MouseEventType
+from prompt_toolkit.shortcuts import input_dialog
+from prompt_toolkit.styles import Style
+from textual.app import App, ComposeResult
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Log,
+    ProgressBar,
+    Static,
+)
+from qfil import (
+    build_qfil_module_command,
+    parse_program_entries,
+    parse_rescue_cmd,
+    run_qfil_plan,
+    summarize_plan,
+)
 
 
 @dataclass
@@ -57,7 +81,6 @@ class MenuState:
     sn: str = DEFAULT_SN
     imei: str = ""
     imei2: str = ""
-    edl: Path = DEFAULT_EDL
     image_dir: str = ""
     firmware_index: int | None = None
 
@@ -75,6 +98,10 @@ class SettingItem:
     title: str
     getter: Callable[[MenuState], str]
     setter: Callable[[MenuState, str], None]
+
+
+def dict_value(value: object) -> dict[str, Any]:
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
 
 
 def quote_command(command: list[str]) -> str:
@@ -109,6 +136,11 @@ def ui_margin(width: int) -> str:
     return " " * max(0, (columns - width) // 2)
 
 
+def ui_top_padding(rows: int) -> str:
+    lines = shutil.get_terminal_size((100, 30)).lines
+    return "\n" * max(0, (lines - rows) // 2)
+
+
 def box_line(text: str = "", *, width: int, margin: str) -> str:
     return f"{margin}│ {fit_text(text, width - 4)} │\n"
 
@@ -130,6 +162,13 @@ def wrap_for_box(text: str, *, width: int, subsequent_indent: str = "  ") -> lis
     ) or [""]
 
 
+def wrap_lines_for_box(text: str, *, width: int) -> list[str]:
+    lines: list[str] = []
+    for value in str(text).splitlines() or [""]:
+        lines.extend(wrap_for_box(value, width=width))
+    return lines or [""]
+
+
 def styled_box_line(text: str, *, width: int, margin: str, style: str):
     return [
         ("class:screen", margin),
@@ -144,6 +183,67 @@ def box_rule(*, width: int, margin: str, kind: str = "mid") -> str:
     return f"{margin}{left}" + "─" * (width - 2) + f"{right}\n"
 
 
+def title_rule(title: str, *, width: int, margin: str):
+    left, right = BORDER["top"]
+    inner_width = max(0, width - 2)
+    label = f" {title} "
+    if len(label) > inner_width:
+        label = fit_text(label, inner_width)
+    left_rule = max(0, (inner_width - len(label)) // 2)
+    right_rule = max(0, inner_width - len(label) - left_rule)
+    return [
+        ("class:screen", margin),
+        ("class:border", left + "─" * left_rule),
+        ("class:title", label),
+        ("class:border", "─" * right_rule + right + "\n"),
+    ]
+
+
+def centered_box_line(text: str, *, width: int, margin: str, style: str):
+    inner_width = max(0, width - 4)
+    value = fit_text(text, inner_width)
+    padding = max(0, inner_width - len(value.rstrip()))
+    left_padding = padding // 2
+    right_padding = padding - left_padding
+    return [
+        ("class:screen", margin),
+        ("class:border", "│ "),
+        (style, " " * left_padding + value.rstrip() + " " * right_padding),
+        ("class:border", " │\n"),
+    ]
+
+
+def clickable_log_controls(
+    *,
+    width: int,
+    margin: str,
+    older: Callable,
+    newer: Callable,
+    latest: Callable,
+):
+    inner_width = max(0, width - 4)
+    labels = [("[ Older ]", older), ("  [ Newer ]", newer), ("  [ Latest ]", latest)]
+    if inner_width < 32:
+        labels = [("[Old]", older), (" [New]", newer), (" [End]", latest)]
+    text_width = sum(len(label) for label, _ in labels)
+    left_padding = max(0, (inner_width - text_width) // 2)
+    right_padding = max(0, inner_width - text_width - left_padding)
+    fragments: list[tuple[Any, ...]] = [
+        ("class:screen", margin),
+        ("class:border", "│ "),
+        ("class:normal", " " * left_padding),
+    ]
+    for label, handler in labels:
+        fragments.append(("class:button-focus", label, handler))
+    fragments.extend(
+        [
+            ("class:normal", " " * right_padding),
+            ("class:border", " │\n"),
+        ]
+    )
+    return fragments
+
+
 def state_to_json(state: MenuState) -> dict[str, str | int]:
     return {
         "version": STATE_VERSION,
@@ -153,7 +253,6 @@ def state_to_json(state: MenuState) -> dict[str, str | int]:
         "sn": state.sn,
         "imei": state.imei,
         "imei2": state.imei2,
-        "edl": str(state.edl),
         "image_dir": state.image_dir,
         "firmware_index": state.firmware_index
         if state.firmware_index is not None
@@ -207,8 +306,7 @@ def status_text(state: MenuState) -> str:
             f"SN:         {value_or_unset(state.sn)}",
             f"IMEI:       {value_or_unset(state.imei)}",
             f"IMEI2:      {value_or_unset(state.imei2)}",
-            f"Firmware:   {state.firmware_index if state.firmware_index is not None else 'auto'}",
-            f"edl.py:     {state.edl}",
+            f"Selected ROM: {state.firmware_index if state.firmware_index is not None else 'not selected'}",
             f"Image dir:  {path_or_auto(state.image_dir)}",
         ]
     )
@@ -218,39 +316,382 @@ def menu_text(state: MenuState) -> str:
     return (
         f"SN: {value_or_unset(state.sn)}    IMEI: {value_or_unset(state.imei)}\n"
         f"Model: {value_or_unset(state.model)}\n"
-        f"Firmware: {state.firmware_index if state.firmware_index is not None else 'auto'}\n"
+        f"Selected ROM: {state.firmware_index if state.firmware_index is not None else 'not selected'}\n"
         f"Token: {state.token_file}\n"
         f"Work: {state.work_dir}\n"
         f"ROM/tool cache: {state.work_dir / 'software_fix'}"
     )
 
 
-def cli_base(state: MenuState) -> list[str]:
-    command = [
-        sys.executable,
-        "-u",
-        "-m",
-        "lrsa.cli",
+def cli_args_base(state: MenuState) -> list[str]:
+    args = [
         "--token-file",
         str(state.token_file),
         "--work-dir",
         str(state.work_dir),
-        "--edl",
-        str(state.edl),
     ]
     if state.model:
-        command.extend(["--model", state.model])
+        args.extend(["--model", state.model])
     if state.sn:
-        command.extend(["--sn", state.sn])
+        args.extend(["--sn", state.sn])
     if state.imei:
-        command.extend(["--imei", state.imei])
+        args.extend(["--imei", state.imei])
     if state.imei2:
-        command.extend(["--imei2", state.imei2])
+        args.extend(["--imei2", state.imei2])
     if state.image_dir:
-        command.extend(["--image-dir", state.image_dir])
+        args.extend(["--image-dir", state.image_dir])
     if state.firmware_index is not None:
-        command.extend(["--firmware-index", str(state.firmware_index)])
-    return command
+        args.extend(["--firmware-index", str(state.firmware_index)])
+    return args
+
+
+def quote_lrsa_args(args: list[str]) -> str:
+    return command_text(["lrsa", *args])
+
+
+def format_bytes(value: int | str | None) -> str:
+    if value in (None, ""):
+        return "unknown"
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(size)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.1f} {unit}" if unit != "B" else f"{size} B"
+        amount /= 1024
+    return f"{size} B"
+
+
+def resource_url_label(url: str | None) -> str:
+    if not url:
+        return "(none)"
+    parsed = urlparse(url)
+    filename = Path(unquote(parsed.path)).name
+    return f"{parsed.netloc}/{filename}" if filename else parsed.netloc or url
+
+
+def matching_manifest(resource: dict | None, work_dir: Path | None) -> dict | None:
+    if not resource or work_dir is None:
+        return None
+    path = Path(work_dir) / "software_fix" / "manifest.json"
+    if not path.exists():
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    rom = dict_value(resource.get("romResource"))
+    if manifest.get("romName") != rom.get("name"):
+        return None
+    return manifest
+
+
+def local_rom_archive_size(resource: dict | None, work_dir: Path | None) -> str | None:
+    if not resource or work_dir is None:
+        return None
+    rom = dict_value(resource.get("romResource"))
+    filename = resource_filename(rom)
+    if not filename:
+        return None
+    path = Path(work_dir) / "software_fix" / "downloads" / filename
+    if path.exists() and path.stat().st_size > 0:
+        return f"cached file: {format_bytes(path.stat().st_size)}"
+    manifest = matching_manifest(resource, work_dir)
+    archive = Path(manifest.get("romArchive", "")) if manifest else None
+    if archive and archive.exists() and archive.stat().st_size > 0:
+        return f"cached file: {format_bytes(archive.stat().st_size)}"
+    return None
+
+
+def resource_known_size(
+    resource: dict | None, work_dir: Path | None = None
+) -> str | None:
+    if not resource:
+        return None
+    rom = dict_value(resource.get("romResource"))
+    for key in (
+        "size",
+        "fileSize",
+        "downloadSize",
+        "contentLength",
+        "length",
+        "bytes",
+    ):
+        if rom.get(key) not in (None, ""):
+            return format_bytes(rom.get(key))
+    return local_rom_archive_size(resource, work_dir)
+
+
+def manifest_flash_flow_label(manifest: dict | None) -> str | None:
+    if not manifest:
+        return None
+    summary = manifest.get("flashFlowSummary")
+    if not isinstance(summary, list) or not summary:
+        return None
+    flow_name = str(summary[0])
+    tools: list[str] = []
+    startups: list[str] = []
+    ports: list[str] = []
+    for line in summary[1:]:
+        text = str(line)
+        if "tool=" in text:
+            tools.append(text.split("tool=", 1)[1].split(";", 1)[0].split("]", 1)[0])
+        if "startup=" in text:
+            startups.append(
+                text.split("startup=", 1)[1].split(";", 1)[0].split("]", 1)[0]
+            )
+        if "ports=" in text:
+            ports.append(text.split("ports=", 1)[1].split(";", 1)[0].split("]", 1)[0])
+    details = [*dict.fromkeys(tools), *dict.fromkeys(startups), *dict.fromkeys(ports)]
+    return f"{flow_name} ({', '.join(details)})" if details else flow_name
+
+
+def resource_install_mode(resource: dict | None, manifest: dict | None = None) -> str:
+    if not resource:
+        return "unknown"
+    if manifest:
+        flow_label = manifest_flash_flow_label(manifest) or ""
+        flow_text = json.dumps(
+            manifest.get("flashFlowSummary", []), default=str
+        ).lower()
+        if "qfil" in flow_text or "qdloader" in flow_text:
+            return f"EDL / QFIL - {flow_label}" if flow_label else "EDL / QFIL"
+        if "fastboot" in flow_text:
+            return f"Fastboot - {flow_label}" if flow_label else "Fastboot"
+    platform = str(resource.get("platform") or "").lower()
+    tool = dict_value(resource.get("toolResource"))
+    tool_name = str(tool.get("name") or "")
+    flash_flow = str(resource.get("flashFlow") or "")
+    if resource.get("fastboot") is True:
+        return "Fastboot"
+    if (
+        "qcom" in platform
+        or "qfil" in tool_name.lower()
+        or "recoveryqcom" in flash_flow.lower()
+    ):
+        return "EDL / QFIL"
+    return "unknown"
+
+
+def firmware_table_row(index: int, resource: dict) -> tuple[str, str, str, str, str]:
+    summary = resource_summary(resource)
+    firmware = summary.get("firmwareName") or "(unnamed ROM)"
+    model = (
+        summary.get("modelName") or summary.get("realModelName") or "(unknown model)"
+    )
+    rom = dict_value(resource.get("romResource"))
+    published = rom.get("publishDate")
+    return (
+        str(index),
+        str(firmware),
+        str(model),
+        resource_install_mode(resource),
+        str(published or "(no date)"),
+    )
+
+
+def firmware_detail_text(
+    resource: dict | None,
+    *,
+    index: int | None = None,
+    download_size: str | None = None,
+    work_dir: Path | None = None,
+) -> str:
+    if not resource:
+        return "No firmware selected."
+    summary = resource_summary(resource)
+    rom = dict_value(resource.get("romResource"))
+    tool = dict_value(resource.get("toolResource"))
+    manifest = matching_manifest(resource, work_dir)
+    size = (
+        download_size
+        or resource_known_size(resource, work_dir)
+        or "not provided by API; shown during download"
+    )
+    flash_flow = manifest_flash_flow_label(manifest)
+    if not flash_flow:
+        flash_flow = (
+            "available, not loaded yet" if resource.get("flashFlow") else "missing"
+        )
+    lines = [
+        f"Selection: {index if index is not None else '(none)'}",
+        f"Firmware: {summary.get('firmwareName') or '(unnamed ROM)'}",
+        f"Model: {summary.get('modelName') or summary.get('realModelName') or '(unknown)'}",
+        f"Market: {summary.get('marketName') or '(unknown)'}",
+        f"Category / platform: {resource.get('category') or '(unknown)'} / {resource.get('platform') or '(unknown)'}",
+        f"Install mode: {resource_install_mode(resource, manifest)}",
+        f"Download size: {size}",
+        f"Publish date: {rom.get('publishDate') or '(none)'}",
+        f"ROM package: {rom.get('name') or '(none)'}",
+        f"ROM MD5: {rom.get('md5') or '(none)'}",
+        f"ROM unzip: {rom.get('unZip')}",
+        f"Tool package: {tool.get('name') or '(none)'}",
+        f"Tool unzip: {tool.get('unZip')}",
+        f"Flash flow: {flash_flow}",
+        f"Fastboot flag: {resource.get('fastboot')}",
+        f"Match id: {summary.get('romMatchId') or '(none)'}",
+        f"ROM URL: {resource_url_label(summary.get('firmwareUrl'))}",
+    ]
+    return "\n".join(lines)
+
+
+def read_manifest(work_dir: Path) -> dict | None:
+    path = Path(work_dir) / "software_fix" / "manifest.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def find_startup_candidate(root: Path) -> Path | None:
+    if not root.exists():
+        return None
+    for name in ("Rescue.cmd", "Flash.cmd", "flash.cmd", "rescue.cmd"):
+        candidate = root / name
+        if candidate.exists():
+            return candidate
+    for candidate in root.rglob("*"):
+        if candidate.is_file() and candidate.name.lower() in {
+            "rescue.cmd",
+            "flash.cmd",
+        }:
+            return candidate
+    return None
+
+
+def qfil_xml_summary(root: Path) -> str:
+    if not root.exists():
+        return "missing"
+    rawprograms = list(root.rglob("rawprogram*.xml"))
+    patches = list(root.rglob("patch*.xml"))
+    if not rawprograms:
+        return "missing rawprogram XML"
+    return f"{len(rawprograms)} rawprogram, {len(patches)} patch"
+
+
+def add_local_firmware_candidate(
+    candidates: list[dict[str, str]],
+    seen: set[Path],
+    *,
+    path: Path,
+    name: str,
+    source: str,
+    startup: str = "",
+    flow: str = "",
+) -> None:
+    if not path.exists() or not path.is_dir():
+        return
+    resolved = path.resolve()
+    if resolved in seen:
+        return
+    seen.add(resolved)
+    startup_path = Path(startup) if startup else find_startup_candidate(resolved)
+    candidates.append(
+        {
+            "name": name or resolved.name,
+            "path": str(resolved),
+            "source": source,
+            "startup": str(startup_path) if startup_path else "",
+            "flow": flow,
+            "qfil": qfil_xml_summary(resolved),
+        }
+    )
+
+
+def local_firmware_candidates(state: MenuState) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen: set[Path] = set()
+    manifest = read_manifest(state.work_dir)
+    if manifest:
+        rom_dir_value = str(manifest.get("romDir") or "")
+        if rom_dir_value:
+            rom_dir = Path(rom_dir_value)
+            flow = manifest_flash_flow_label(manifest) or ""
+            add_local_firmware_candidate(
+                candidates,
+                seen,
+                path=rom_dir,
+                name=str(manifest.get("romName") or rom_dir.name),
+                source="Software Fix manifest",
+                startup=str(manifest.get("startupFile") or ""),
+                flow=flow,
+            )
+    if state.image_dir:
+        image_dir = Path(state.image_dir)
+        add_local_firmware_candidate(
+            candidates,
+            seen,
+            path=image_dir,
+            name=image_dir.name,
+            source="Configured image dir",
+        )
+    rom_dir = Path(state.work_dir) / "software_fix" / "rom"
+    add_local_firmware_candidate(
+        candidates,
+        seen,
+        path=rom_dir,
+        name=rom_dir.name,
+        source="Extracted Software Fix ROM",
+    )
+    return candidates
+
+
+def local_firmware_detail_text(
+    candidate: dict[str, str] | None,
+    device: dict[str, str] | None = None,
+) -> str:
+    if not candidate:
+        return "Select a locally extracted firmware package."
+    device_line = "not selected"
+    if device:
+        detail = f" - {device['detail']}" if device.get("detail") else ""
+        device_line = (
+            f"{device.get('transport', '').upper()}: {device.get('serial')} "
+            f"[{device.get('state')}]{detail}"
+        )
+    lines = [
+        f"Firmware: {candidate.get('name') or '(unnamed local firmware)'}",
+        f"Path: {candidate.get('path')}",
+        f"Source: {candidate.get('source')}",
+        f"Startup file: {candidate.get('startup') or '(missing Rescue.cmd / Flash.cmd)'}",
+        f"QFIL files: {candidate.get('qfil') or 'unknown'}",
+        f"Flash flow: {candidate.get('flow') or 'local qfil plan'}",
+        f"Selected device: {device_line}",
+    ]
+    return "\n".join(lines)
+
+
+def run_local_qfil_flash(candidate: dict[str, str], *, flash: bool) -> None:
+    if not candidate.get("startup"):
+        raise RuntimeError(
+            "Selected firmware has no Rescue.cmd or Flash.cmd. Run Extract ROM first."
+        )
+    base_dir = Path(candidate["path"]).resolve()
+    startup = Path(candidate["startup"]).resolve()
+    image_dir = resolve_qfil_image_dir(base_dir, startup)
+    qfil_plan = parse_rescue_cmd(startup, image_dir)
+    get_logger(__name__).info("\nNative qfil compatibility plan:")
+    for line in summarize_plan(qfil_plan):
+        get_logger(__name__).info("  %s", line)
+    rawprograms = list(qfil_plan.firehose.rawprograms)
+    patches = list(qfil_plan.firehose.patches)
+    missing_xml = [
+        str(path) for path in [*rawprograms, *patches] if not Path(path).exists()
+    ]
+    if missing_xml:
+        raise RuntimeError(
+            "Native qfil XML preflight failed: " + ", ".join(missing_xml)
+        )
+    program_entries = parse_program_entries(rawprograms)
+    get_logger(__name__).info("Program entries: %s", len(program_entries))
+    get_logger(__name__).info(" ".join(build_qfil_module_command(qfil_plan)))
+    run_qfil_plan(qfil_plan, dry_run=not flash)
 
 
 def login_command(state: MenuState) -> list[str]:
@@ -268,28 +709,22 @@ def login_command(state: MenuState) -> list[str]:
     ]
 
 
-def dry_run_command(state: MenuState) -> list[str]:
-    command = cli_base(state)
-    command.extend(["--login", "none"])
-    return command
+def dry_run_args(state: MenuState) -> list[str]:
+    args = cli_args_base(state)
+    args.extend(["--login", "none"])
+    return args
 
 
-def prepare_command(state: MenuState) -> list[str]:
-    command = cli_base(state)
-    command.extend(["--login", "none", "--download", "--extract"])
-    return command
+def download_args(state: MenuState) -> list[str]:
+    args = cli_args_base(state)
+    args.extend(["--login", "none", "--download"])
+    return args
 
 
-def flash_command(state: MenuState) -> list[str]:
-    command = cli_base(state)
-    command.extend(["--login", "none", "--download", "--extract", "--flash"])
-    return command
-
-
-def verify_boot_chain_command(state: MenuState) -> list[str]:
-    command = cli_base(state)
-    command.extend(["--login", "none", "--verify-boot-chain"])
-    return command
+def extract_args(state: MenuState) -> list[str]:
+    args = cli_args_base(state)
+    args.extend(["--login", "none", "--extract"])
+    return args
 
 
 def ui_style():
@@ -300,7 +735,7 @@ def ui_style():
             "dialog": "bg:#111111",
             "root": "bg:#111111 #e6e6e6",
             "screen": "bg:#111111 #e6e6e6",
-            "dialog frame-label": "bg:#111111 #ffffff",
+            "dialog frame-label": "bg:#111111 #ff3b30 bold",
             "dialog.body": "bg:#111111 #e6e6e6",
             "dialog shadow": "bg:#000000",
             "button": "bg:#303030 #e6e6e6",
@@ -308,16 +743,17 @@ def ui_style():
             "radio": "#bbbbbb",
             "radio-checked": "#ffffff bold",
             "text-area": "bg:#202020 #ffffff",
-            "title": "bg:#111111 #ffffff bold",
+            "title": "bg:#111111 #ff3b30 bold",
             "normal": "bg:#111111 #e6e6e6",
-            "selected": "bg:#263238 #ffffff bold",
-            "selected-detail": "bg:#151f27 #b8d7ff",
-            "muted": "bg:#111111 #9e9e9e",
-            "footer": "bg:#111111 #8a8f98",
-            "border": "bg:#111111 #5f6872",
-            "section": "bg:#111111 #cfd8dc bold",
+            "selected": "bg:#333333 #ffffff bold",
+            "selected-detail": "bg:#111111 #c8c8c8",
+            "muted": "bg:#111111 #c8c8c8",
+            "footer": "bg:#111111 #9a9a9a",
+            "border": "bg:#111111 #b8b8b8",
+            "section": "bg:#111111 #ff3b30 bold",
             "shortcut": "bg:#111111 #8ab4f8",
             "progress": "bg:#111111 #7dd3fc bold",
+            "button-focus": "bg:#333333 #e6e6e6 bold",
         }
     )
 
@@ -334,27 +770,16 @@ def choose_item(
     def fragments():
         width = ui_width()
         margin = ui_margin(width)
-        text_lines = text.splitlines()
-        content_rows = 10 + len(text_lines) + len(items)
-        top_padding = max(
-            0, (shutil.get_terminal_size((100, 30)).lines - content_rows) // 2
-        )
+        text_lines = wrap_lines_for_box(text, width=width)
+        content_rows = 9 + len(text_lines) + len(items)
         selected_item = items[selected]
 
-        result = [("class:screen", "\n" * top_padding)]
-        result.append(
-            ("class:border", box_rule(width=width, margin=margin, kind="top"))
-        )
-        result.append(
-            ("class:title", box_line(f" {title} ", width=width, margin=margin))
-        )
+        result = [("class:screen", ui_top_padding(content_rows))]
+        result.extend(title_rule(title, width=width, margin=margin))
         result.append(("class:border", box_rule(width=width, margin=margin)))
-        for line in text.splitlines():
+        for line in text_lines:
             result.append(("class:muted", box_line(line, width=width, margin=margin)))
         result.append(("class:border", box_rule(width=width, margin=margin)))
-        result.append(
-            ("class:section", box_line(" Actions", width=width, margin=margin))
-        )
         for index, item in enumerate(items):
             active = index == selected
             prefix = "> " if active else "  "
@@ -462,10 +887,50 @@ def choose_item(
 
 
 def show_message(title: str, text: str) -> None:
-    if message_dialog is None:
+    if Application is None or not sys.stdin.isatty() or not sys.stdout.isatty():
         get_logger(__name__).info(f"\n{title}\n{text}\n")
         return
-    message_dialog(title=title, text=text, ok_text="Back", style=ui_style()).run()
+
+    def fragments():
+        width = ui_width()
+        margin = ui_margin(width)
+        lines = wrap_lines_for_box(text, width=width)
+        rows = 5 + len(lines)
+        result = [("class:screen", ui_top_padding(rows))]
+        result.extend(title_rule(title, width=width, margin=margin))
+        result.append(("class:border", box_rule(width=width, margin=margin)))
+        for line in lines:
+            result.append(("class:muted", box_line(line, width=width, margin=margin)))
+        result.append(("class:normal", box_line("", width=width, margin=margin)))
+        result.extend(
+            centered_box_line(
+                "<  Back  >", width=width, margin=margin, style="class:button-focus"
+            )
+        )
+        result.append(
+            ("class:border", box_rule(width=width, margin=margin, kind="bottom"))
+        )
+        return result
+
+    control = FormattedTextControl(fragments, focusable=True)
+    window = Window(control, wrap_lines=False, style="class:screen")
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    @bindings.add("escape")
+    @bindings.add("q")
+    @bindings.add("c-c")
+    def _close(event):
+        event.app.exit()
+
+    app = Application(
+        layout=Layout(HSplit([window], style="class:screen"), focused_element=window),
+        key_bindings=bindings,
+        style=ui_style(),
+        full_screen=True,
+        mouse_support=False,
+    )
+    app.run()
 
 
 def prompt_value(title: str, label: str, default: str) -> str | None:
@@ -531,18 +996,11 @@ def confirm_flash_view(command: list[str]) -> bool:
         width = ui_width()
         margin = ui_margin(width)
         rows = 15 + len(command_lines)
-        top_padding = max(0, (shutil.get_terminal_size((100, 30)).lines - rows) // 2)
         input_value = typed["value"] or ""
         cursor = " " if input_value else "_"
-        result_fragments = [("class:screen", "\n" * top_padding)]
-        result_fragments.append(
-            ("class:border", box_rule(width=width, margin=margin, kind="top"))
-        )
-        result_fragments.append(
-            (
-                "class:title",
-                box_line(" Flash Confirmation ", width=width, margin=margin),
-            )
+        result_fragments = [("class:screen", ui_top_padding(rows))]
+        result_fragments.extend(
+            title_rule("Flash Confirmation", width=width, margin=margin)
         )
         result_fragments.append(("class:border", box_rule(width=width, margin=margin)))
         result_fragments.append(
@@ -652,12 +1110,561 @@ def confirm_flash_view(command: list[str]) -> bool:
     return result["confirmed"]
 
 
+def run_command_view(command: list[str], *, stdin_text: str | None = None) -> int:
+    lines: list[str] = ["Running:", quote_command(command), ""]
+    state: dict[str, bool | int | None] = {"done": False, "returncode": None}
+    scroll = {"offset": 0}
+    process_holder: dict[str, subprocess.Popen[str] | None] = {"process": None}
+    app_holder: dict[str, Application | None] = {"app": None}
+    lock = threading.Lock()
+
+    def append_line(line: str) -> None:
+        with lock:
+            lines.append(line.rstrip("\n"))
+            del lines[:-2000]
+        app = app_holder["app"]
+        if app is not None:
+            app.invalidate()
+
+    def worker() -> None:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE if stdin_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            process_holder["process"] = process
+            if stdin_text is not None and process.stdin is not None:
+                process.stdin.write(stdin_text)
+                process.stdin.flush()
+                process.stdin.close()
+            if process.stdout is not None:
+                for output_line in process.stdout:
+                    append_line(output_line)
+            returncode = process.wait()
+        except Exception as exc:
+            append_line(f"Command failed to start: {exc}")
+            returncode = 1
+        with lock:
+            state["done"] = True
+            state["returncode"] = returncode
+        append_line(
+            f"Command finished with exit code {returncode}."
+            if returncode
+            else "Command finished successfully."
+        )
+
+    def wrapped_lines(width: int) -> list[str]:
+        wrapped: list[str] = []
+        with lock:
+            source = list(lines)
+        for line in source:
+            wrapped.extend(wrap_for_box(line, width=width))
+        return wrapped
+
+    def output_height() -> int:
+        terminal_lines = shutil.get_terminal_size((100, 30)).lines
+        panel_rows = min(max(12, terminal_lines - 4), terminal_lines)
+        return max(3, panel_rows - 7)
+
+    def max_scroll(width: int, height: int) -> int:
+        return max(0, len(wrapped_lines(width)) - height)
+
+    def visible_lines(width: int, height: int) -> list[str]:
+        wrapped = wrapped_lines(width)
+        if height <= 0:
+            return []
+        with lock:
+            scroll["offset"] = min(scroll["offset"], max(0, len(wrapped) - height))
+            offset = scroll["offset"]
+        end = max(0, len(wrapped) - offset)
+        start = max(0, end - height)
+        return wrapped[start:end]
+
+    def set_scroll_by(delta: int) -> None:
+        width = ui_width()
+        height = output_height()
+        with lock:
+            scroll["offset"] = max(
+                0, min(scroll["offset"] + delta, max_scroll(width, height))
+            )
+        app = app_holder["app"]
+        if app is not None:
+            app.invalidate()
+
+    def scroll_by(delta: int, event) -> None:
+        set_scroll_by(delta)
+        event.app.invalidate()
+
+    def click_older(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            set_scroll_by(output_height())
+
+    def click_newer(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            set_scroll_by(-output_height())
+
+    def click_latest(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            with lock:
+                scroll["offset"] = 0
+            app = app_holder["app"]
+            if app is not None:
+                app.invalidate()
+
+    def fragments():
+        width = ui_width()
+        margin = ui_margin(width)
+        terminal_lines = shutil.get_terminal_size((100, 30)).lines
+        panel_rows = min(max(12, terminal_lines - 4), terminal_lines)
+        height = max(3, panel_rows - 7)
+        with lock:
+            done = bool(state["done"])
+            returncode = state["returncode"]
+        result = [("class:screen", ui_top_padding(panel_rows))]
+        result.extend(title_rule("Command Output", width=width, margin=margin))
+        result.append(("class:border", box_rule(width=width, margin=margin)))
+        for line in visible_lines(width, height):
+            result.append(("class:muted", box_line(line, width=width, margin=margin)))
+        result.append(("class:border", box_rule(width=width, margin=margin)))
+        if done:
+            status = (
+                "Exit code: 0"
+                if returncode == 0
+                else f"Exit code: {returncode if returncode is not None else 'unknown'}"
+            )
+            result.append(
+                ("class:footer", box_line(status, width=width, margin=margin))
+            )
+            result.append(
+                (
+                    "class:footer",
+                    box_line(
+                        "Up/PgUp: older  Down/PgDn/End: newer  Enter: back",
+                        width=width,
+                        margin=margin,
+                    ),
+                )
+            )
+            result.extend(
+                clickable_log_controls(
+                    width=width,
+                    margin=margin,
+                    older=click_older,
+                    newer=click_newer,
+                    latest=click_latest,
+                )
+            )
+            result.extend(
+                centered_box_line(
+                    "<  Back  >",
+                    width=width,
+                    margin=margin,
+                    style="class:button-focus",
+                )
+            )
+        else:
+            result.append(
+                (
+                    "class:footer",
+                    box_line(
+                        "Running... Up/PgUp: older  End: latest  Ctrl-C: stop",
+                        width=width,
+                        margin=margin,
+                    ),
+                )
+            )
+            result.extend(
+                clickable_log_controls(
+                    width=width,
+                    margin=margin,
+                    older=click_older,
+                    newer=click_newer,
+                    latest=click_latest,
+                )
+            )
+        result.append(
+            ("class:border", box_rule(width=width, margin=margin, kind="bottom"))
+        )
+        return result
+
+    control = FormattedTextControl(fragments, focusable=True)
+    window = Window(control, wrap_lines=False, style="class:screen")
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    @bindings.add("escape")
+    @bindings.add("q")
+    def _close_when_done(event):
+        with lock:
+            done = bool(state["done"])
+        if done:
+            event.app.exit()
+
+    @bindings.add("up")
+    @bindings.add("k")
+    def _scroll_up(event):
+        scroll_by(1, event)
+
+    @bindings.add("down")
+    @bindings.add("j")
+    def _scroll_down(event):
+        scroll_by(-1, event)
+
+    @bindings.add(Keys.ScrollUp)
+    def _mouse_scroll_up(event):
+        scroll_by(3, event)
+
+    @bindings.add(Keys.ScrollDown)
+    def _mouse_scroll_down(event):
+        scroll_by(-3, event)
+
+    @bindings.add("pageup")
+    @bindings.add("c-b")
+    def _page_up(event):
+        scroll_by(output_height(), event)
+
+    @bindings.add("pagedown")
+    @bindings.add("c-f")
+    def _page_down(event):
+        scroll_by(-output_height(), event)
+
+    @bindings.add("home")
+    def _home(event):
+        width = ui_width()
+        height = output_height()
+        with lock:
+            scroll["offset"] = max_scroll(width, height)
+        event.app.invalidate()
+
+    @bindings.add("end")
+    def _end(event):
+        with lock:
+            scroll["offset"] = 0
+        event.app.invalidate()
+
+    @bindings.add("c-c")
+    def _cancel(event):
+        process = process_holder["process"]
+        if process is not None and process.poll() is None:
+            append_line("Stopping command...")
+            process.terminate()
+            return
+        event.app.exit()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    app = Application(
+        layout=Layout(HSplit([window], style="class:screen"), focused_element=window),
+        key_bindings=bindings,
+        style=ui_style(),
+        full_screen=True,
+        mouse_support=True,
+    )
+    app_holder["app"] = app
+    app.run()
+    thread.join(timeout=0.2)
+    with lock:
+        return int(state["returncode"] or 0)
+
+
+def run_direct_view(title: str, command_line: str, target: Callable[[], None]) -> int:
+    lines: list[str] = ["Running:", command_line, ""]
+    state: dict[str, bool | int | None] = {"done": False, "returncode": None}
+    scroll = {"offset": 0}
+    app_holder: dict[str, Application | None] = {"app": None}
+    lock = threading.Lock()
+
+    def append_line(line: str) -> None:
+        with lock:
+            lines.append(line.rstrip("\n"))
+            del lines[:-2000]
+        app = app_holder["app"]
+        if app is not None:
+            app.invalidate()
+
+    class TuiLogHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            append_line(self.format(record))
+
+    def worker() -> None:
+        root = logging.getLogger()
+        old_handlers = root.handlers[:]
+        old_level = root.level
+        handler = TuiLogHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        root.handlers = [handler]
+        root.setLevel(logging.INFO)
+        returncode = 0
+        try:
+            target()
+        except SystemExit as exc:
+            returncode = int(exc.code) if isinstance(exc.code, int) else 1
+            if exc.code not in (None, 0):
+                append_line(f"Command exited: {exc.code}")
+        except Exception as exc:
+            returncode = 1
+            append_line(f"Error: {exc}")
+        finally:
+            root.handlers = old_handlers
+            root.setLevel(old_level)
+        with lock:
+            state["done"] = True
+            state["returncode"] = returncode
+        append_line(
+            f"Command finished with exit code {returncode}."
+            if returncode
+            else "Command finished successfully."
+        )
+
+    def wrapped_lines(width: int) -> list[str]:
+        wrapped: list[str] = []
+        with lock:
+            source = list(lines)
+        for line in source:
+            wrapped.extend(wrap_for_box(line, width=width))
+        return wrapped
+
+    def output_height() -> int:
+        terminal_lines = shutil.get_terminal_size((100, 30)).lines
+        panel_rows = min(max(12, terminal_lines - 4), terminal_lines)
+        return max(3, panel_rows - 7)
+
+    def max_scroll(width: int, height: int) -> int:
+        return max(0, len(wrapped_lines(width)) - height)
+
+    def visible_lines(width: int, height: int) -> list[str]:
+        wrapped = wrapped_lines(width)
+        if height <= 0:
+            return []
+        with lock:
+            scroll["offset"] = min(scroll["offset"], max(0, len(wrapped) - height))
+            offset = scroll["offset"]
+        end = max(0, len(wrapped) - offset)
+        start = max(0, end - height)
+        return wrapped[start:end]
+
+    def set_scroll_by(delta: int) -> None:
+        width = ui_width()
+        height = output_height()
+        with lock:
+            scroll["offset"] = max(
+                0, min(scroll["offset"] + delta, max_scroll(width, height))
+            )
+        app = app_holder["app"]
+        if app is not None:
+            app.invalidate()
+
+    def scroll_by(delta: int, event) -> None:
+        set_scroll_by(delta)
+        event.app.invalidate()
+
+    def click_older(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            set_scroll_by(output_height())
+
+    def click_newer(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            set_scroll_by(-output_height())
+
+    def click_latest(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            with lock:
+                scroll["offset"] = 0
+            app = app_holder["app"]
+            if app is not None:
+                app.invalidate()
+
+    def fragments():
+        width = ui_width()
+        margin = ui_margin(width)
+        terminal_lines = shutil.get_terminal_size((100, 30)).lines
+        panel_rows = min(max(12, terminal_lines - 4), terminal_lines)
+        height = max(3, panel_rows - 7)
+        with lock:
+            done = bool(state["done"])
+            returncode = state["returncode"]
+        result = [("class:screen", ui_top_padding(panel_rows))]
+        result.extend(title_rule(title, width=width, margin=margin))
+        result.append(("class:border", box_rule(width=width, margin=margin)))
+        for line in visible_lines(width, height):
+            result.append(("class:muted", box_line(line, width=width, margin=margin)))
+        result.append(("class:border", box_rule(width=width, margin=margin)))
+        if done:
+            status = (
+                "Exit code: 0"
+                if returncode == 0
+                else f"Exit code: {returncode if returncode is not None else 'unknown'}"
+            )
+            result.append(
+                ("class:footer", box_line(status, width=width, margin=margin))
+            )
+            result.append(
+                (
+                    "class:footer",
+                    box_line(
+                        "Up/PgUp: older  Down/PgDn/End: newer  Enter: back",
+                        width=width,
+                        margin=margin,
+                    ),
+                )
+            )
+            result.extend(
+                clickable_log_controls(
+                    width=width,
+                    margin=margin,
+                    older=click_older,
+                    newer=click_newer,
+                    latest=click_latest,
+                )
+            )
+            result.extend(
+                centered_box_line(
+                    "<  Back  >",
+                    width=width,
+                    margin=margin,
+                    style="class:button-focus",
+                )
+            )
+        else:
+            result.append(
+                (
+                    "class:footer",
+                    box_line(
+                        "Running... Up/PgUp: older  End: latest",
+                        width=width,
+                        margin=margin,
+                    ),
+                )
+            )
+            result.extend(
+                clickable_log_controls(
+                    width=width,
+                    margin=margin,
+                    older=click_older,
+                    newer=click_newer,
+                    latest=click_latest,
+                )
+            )
+        result.append(
+            ("class:border", box_rule(width=width, margin=margin, kind="bottom"))
+        )
+        return result
+
+    control = FormattedTextControl(fragments, focusable=True)
+    window = Window(control, wrap_lines=False, style="class:screen")
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    @bindings.add("escape")
+    @bindings.add("q")
+    @bindings.add("c-c")
+    def _close_when_done(event):
+        with lock:
+            done = bool(state["done"])
+        if done:
+            event.app.exit()
+
+    @bindings.add("up")
+    @bindings.add("k")
+    def _scroll_up(event):
+        scroll_by(1, event)
+
+    @bindings.add("down")
+    @bindings.add("j")
+    def _scroll_down(event):
+        scroll_by(-1, event)
+
+    @bindings.add(Keys.ScrollUp)
+    def _mouse_scroll_up(event):
+        scroll_by(3, event)
+
+    @bindings.add(Keys.ScrollDown)
+    def _mouse_scroll_down(event):
+        scroll_by(-3, event)
+
+    @bindings.add("pageup")
+    @bindings.add("c-b")
+    def _page_up(event):
+        scroll_by(output_height(), event)
+
+    @bindings.add("pagedown")
+    @bindings.add("c-f")
+    def _page_down(event):
+        scroll_by(-output_height(), event)
+
+    @bindings.add("home")
+    def _home(event):
+        width = ui_width()
+        height = output_height()
+        with lock:
+            scroll["offset"] = max_scroll(width, height)
+        event.app.invalidate()
+
+    @bindings.add("end")
+    def _end(event):
+        with lock:
+            scroll["offset"] = 0
+        event.app.invalidate()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    app = Application(
+        layout=Layout(HSplit([window], style="class:screen"), focused_element=window),
+        key_bindings=bindings,
+        style=ui_style(),
+        full_screen=True,
+        mouse_support=True,
+    )
+    app_holder["app"] = app
+    app.run()
+    thread.join(timeout=0.2)
+    with lock:
+        return int(state["returncode"] or 0)
+
+
+def run_lrsa_flow(args: list[str], *, title: str, flash: bool = False) -> int:
+    command_line = quote_lrsa_args(args)
+    if flash and not confirm_flash(["lrsa", *args]):
+        return 0
+
+    def target() -> None:
+        run_lrsa_cli(args)
+
+    if Application is not None and sys.stdin.isatty() and sys.stdout.isatty():
+        result = run_direct_view(title, command_line, target)
+    else:
+        get_logger(__name__).info("\nRunning:")
+        get_logger(__name__).info(command_line)
+        get_logger(__name__).info("")
+        try:
+            target()
+            result = 0
+        except SystemExit as exc:
+            result = int(exc.code) if isinstance(exc.code, int) else 1
+        except Exception as exc:
+            get_logger(__name__).error("Error: %s", exc)
+            result = 1
+    if result != 0:
+        get_logger(__name__).error("Command failed with exit code %s", result)
+    return result
+
+
 def run_command(
     command: list[str], *, flash: bool = False, stdin_text: str | None = None
 ) -> int:
     if flash:
         if not confirm_flash(command):
             return 0
+
+    if Application is not None and sys.stdin.isatty() and sys.stdout.isatty():
+        result = run_command_view(command, stdin_text=stdin_text)
+        if result != 0:
+            get_logger(__name__).error("Command failed with exit code %s", result)
+        return result
 
     get_logger(__name__).info("\nRunning:")
     get_logger(__name__).info(quote_command(command))
@@ -753,7 +1760,7 @@ def phone_flow(state: MenuState) -> int:
     state.imei = imei
     state.imei2 = imei2
     save_state(state)
-    return run_command(prepare_command(state))
+    return run_lrsa_flow(download_args(state), title="Download ROM")
 
 
 def device_flow(state: MenuState) -> None:
@@ -780,7 +1787,7 @@ def device_flow(state: MenuState) -> None:
             ],
             "model",
         )
-        if choice in {None, "back"}:
+        if choice is None or choice == "back":
             return
         if choice == "model":
             value = prompt_value(
@@ -851,7 +1858,7 @@ def select_firmware_from_payload(state: MenuState, payload: dict) -> bool:
         )
         match = summary.get("romMatchId") or "(no match id)"
         choice = choose_item(
-            "Firmware Packages",
+            "Available ROMs",
             "One firmware package is available for this device.",
             [
                 MenuItem("select", firmware, f"{model} - {match}"),
@@ -880,12 +1887,12 @@ def select_firmware_from_payload(state: MenuState, payload: dict) -> bool:
 
     default = str(state.firmware_index) if state.firmware_index is not None else "0"
     choice = choose_item(
-        "Firmware Packages",
-        "Select a package to use for download/extract/flash.",
+        "Available ROMs",
+        "Select the ROM package for download/extract/flash.",
         items,
         default,
     )
-    if choice in {None, "back"}:
+    if choice is None or choice == "back":
         return False
     state.firmware_index = int(choice)
     save_state(state)
@@ -902,54 +1909,124 @@ def firmware_flow(state: MenuState, *, refresh: bool = False) -> bool:
 def download_flow(state: MenuState) -> int:
     if not require_lookup_settings(state):
         return 0
-    if not firmware_flow(state, refresh=True):
-        return 0
-    return run_command(prepare_command(state))
-
-
-def flash_flow(state: MenuState) -> int:
-    if not require_lookup_settings(state):
-        return 0
-
     payload = refresh_resources(state)
     if not payload or not select_firmware_from_payload(state, payload):
         return 0
-
     resources = content_list(payload)
-    selected = resources[state.firmware_index or 0] if resources else {}
-    summary = resource_summary(selected)
-    devices = find_qualcomm_edl_devices()
-    device_line = (
-        format_usb_devices(devices)
-        if devices
-        else "No Qualcomm 9008/QDLoader device detected."
-    )
-    lookup_line = (
-        f"IMEI: {state.imei}" if state.imei else f"Model/SN: {state.model} / {state.sn}"
-    )
-    firmware = summary.get("firmwareName") or "(unnamed firmware)"
-    match = summary.get("romMatchId") or "(no match id)"
-    model = (
-        summary.get("modelName") or summary.get("realModelName") or "(unknown model)"
-    )
-
+    selected = resources[state.firmware_index or 0] if resources else None
     choice = choose_item(
-        "Flash Review",
-        "\n".join(
-            [
-                lookup_line,
-                f"Selected ROM: {firmware}",
-                f"Matched device: {model} / {match}",
-                f"EDL device: {device_line}",
-                "",
-                "Next step runs Software Fix native flow with the selected ROM.",
-            ]
+        "Download ROM",
+        firmware_detail_text(
+            selected,
+            index=state.firmware_index,
+            download_size=resource_known_size(selected, state.work_dir),
+            work_dir=state.work_dir,
         ),
         [
             MenuItem(
+                "download",
+                "Download selected ROM",
+                "Fetch the official ROM package into the local Software Fix cache.",
+            ),
+            MenuItem("back", "Back", "Return without downloading."),
+        ],
+        "download",
+    )
+    if choice != "download":
+        return 0
+    return run_lrsa_flow(download_args(state), title="Download ROM")
+
+
+def extract_flow(state: MenuState) -> int:
+    if not require_lookup_settings(state):
+        return 0
+    payload = refresh_resources(state)
+    if not payload or not select_firmware_from_payload(state, payload):
+        return 0
+    resources = content_list(payload)
+    selected = resources[state.firmware_index or 0] if resources else None
+    choice = choose_item(
+        "Extract ROM",
+        firmware_detail_text(
+            selected,
+            index=state.firmware_index,
+            download_size=resource_known_size(selected, state.work_dir),
+            work_dir=state.work_dir,
+        ),
+        [
+            MenuItem(
+                "extract",
+                "Extract selected ROM",
+                "Extract the already downloaded official ROM for native qfil.",
+            ),
+            MenuItem("back", "Back", "Return without extracting."),
+        ],
+        "extract",
+    )
+    if choice != "extract":
+        return 0
+    return run_lrsa_flow(extract_args(state), title="Extract ROM")
+
+
+def flash_flow(state: MenuState) -> int:
+    candidates = local_firmware_candidates(state)
+    if not candidates:
+        show_message(
+            "Flash Firmware",
+            "No locally extracted firmware found. Run Download ROM, then Extract ROM.",
+        )
+        return 0
+    devices = scan_connected_devices()
+    if not devices:
+        show_message(
+            "Flash Firmware",
+            "No ADB, fastboot, or Qualcomm EDL/QDLoader device detected.",
+        )
+        return 0
+    firmware_choice = choose_item(
+        "Local Firmware",
+        "Select locally extracted firmware to flash.",
+        [
+            MenuItem(str(index), candidate["name"], candidate["path"])
+            for index, candidate in enumerate(candidates)
+        ]
+        + [MenuItem("back", "Back", "Return without flashing.")],
+        "0",
+    )
+    if firmware_choice is None or firmware_choice == "back":
+        return 0
+    candidate = candidates[int(firmware_choice)]
+    device_choice = choose_item(
+        "Target Device",
+        local_firmware_detail_text(candidate),
+        [
+            MenuItem(
+                str(index),
+                f"{device.get('transport', '').upper()} {device.get('serial')}",
+                f"{device.get('state')} {device.get('detail') or ''}".strip(),
+            )
+            for index, device in enumerate(devices)
+        ]
+        + [MenuItem("back", "Back", "Return without flashing.")],
+        "0",
+    )
+    if device_choice is None or device_choice == "back":
+        return 0
+    device = devices[int(device_choice)]
+    if device.get("transport") != "edl":
+        show_message(
+            "Flash Firmware",
+            "Selected device is not Qualcomm EDL/QDLoader. Native qfil flashing requires EDL mode.",
+        )
+        return 0
+    choice = choose_item(
+        "Flash Review",
+        local_firmware_detail_text(candidate, device),
+        [
+            MenuItem(
                 "flash",
-                "Continue to FLASH confirmation",
-                "Type FLASH on the next screen to start writing.",
+                "Continue to flash",
+                "Type FLASH on the confirmation screen to start writing.",
             ),
             MenuItem("back", "Back", "Return without flashing."),
         ],
@@ -957,7 +2034,10 @@ def flash_flow(state: MenuState) -> int:
     )
     if choice != "flash":
         return 0
-    return run_command(flash_command(state), flash=True)
+    if not confirm_flash(["lrsa", "flash-local", candidate["path"]]):
+        return 0
+    run_local_qfil_flash(candidate, flash=True)
+    return 0
 
 
 def set_path(attr: str) -> Callable[[MenuState, str], None]:
@@ -985,7 +2065,6 @@ def settings_items() -> list[SettingItem]:
         SettingItem(
             "work_dir", "Work dir", lambda s: str(s.work_dir), set_path("work_dir")
         ),
-        SettingItem("edl", "edl.py", lambda s: str(s.edl), set_path("edl")),
         SettingItem(
             "image_dir", "Image dir", lambda s: s.image_dir, set_str("image_dir")
         ),
@@ -1027,34 +2106,31 @@ def main_items() -> list[MenuItem]:
             "Set Model + SN or IMEI before looking up firmware.",
         ),
         MenuItem(
-            "firmware",
-            "Firmware packages",
-            "Refresh and select an available firmware package for this device.",
-        ),
-        MenuItem(
             "dry_run",
             "Dry-run matched rescue flow",
             "Queries Software Fix metadata and prints the native QFIL plan.",
         ),
         MenuItem(
-            "prepare",
-            "Download + extract selected ROM",
-            "Lists packages, then downloads/extracts the selected official ROM.",
+            "download",
+            "Download ROM",
+            "Looks up available firmware, shows package details, then downloads the selected official ROM.",
         ),
         MenuItem(
-            "verify_boot",
-            "Verify boot chain readback",
-            "Read-only EDL check for ABL/XBL/UEFI partitions against the ROM.",
+            "extract",
+            "Extract ROM",
+            "Extracts the already downloaded official ROM for native qfil.",
         ),
         MenuItem(
             "flash",
-            "Flash native qfil backend",
-            "Runs the Software Fix flow through the native qfil package.",
+            "Flash local firmware",
+            "Selects a connected device and locally extracted firmware, then runs native qfil.",
         ),
         MenuItem(
-            "settings", "Settings", "Edit token path, work dir, edl.py, and image dir."
+            "scan",
+            "Scan connected device",
+            "Detect ADB, fastboot, or Qualcomm EDL/QDLoader state.",
         ),
-        MenuItem("status", "Status", "Show current LRSA configuration."),
+        MenuItem("settings", "Settings", "Edit token path, work dir, and image dir."),
         MenuItem("exit", "Exit", "Quit the interactive CLI."),
     ]
 
@@ -1079,7 +2155,7 @@ def fallback_main(state: MenuState) -> None:
     )
     while True:
         choice = fallback_choose("LRSA Python", main_items())
-        if choice in {None, "exit", "quit"}:
+        if choice is None or choice in {"exit", "quit"}:
             return
         handle_choice(choice, state)
 
@@ -1089,27 +2165,1170 @@ def handle_choice(choice: str, state: MenuState) -> None:
         login_flow(state)
     elif choice == "device":
         device_flow(state)
-    elif choice == "firmware":
-        firmware_flow(state, refresh=True)
     elif choice == "dry_run":
         if require_lookup_settings(state):
-            run_command(dry_run_command(state))
-    elif choice == "prepare":
+            run_lrsa_flow(dry_run_args(state), title="Dry Run")
+    elif choice == "download":
         download_flow(state)
-    elif choice == "verify_boot":
-        run_command(verify_boot_chain_command(state))
+    elif choice == "extract":
+        extract_flow(state)
     elif choice == "flash":
         flash_flow(state)
     elif choice == "phone":
         phone_flow(state)
+    elif choice == "scan":
+        show_message("Connected Device", format_device_states(scan_connected_devices()))
     elif choice == "settings":
         configure(state)
-    elif choice == "status":
-        show_message("Current Settings", status_text(state))
+
+
+class _TextualLogHandler(logging.Handler):
+    def __init__(self, app: "LRSATextualApp") -> None:
+        super().__init__()
+        self.app = app
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.app.call_from_thread(self.app.write_log, self.format(record))
+
+
+class _FirmwareLogHandler(logging.Handler):
+    def __init__(self, app: "LRSATextualApp") -> None:
+        super().__init__()
+        self.app = app
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.app.call_from_thread(self.app.write_firmware_log, self.format(record))
+
+
+class LRSATextualApp(App):
+    """Textual implementation of the LRSA menu."""
+
+    CSS = """
+    Screen {
+        background: #111111;
+        color: #d8d8d8;
+    }
+
+    Header, Footer {
+        background: #111111;
+        color: #d8d8d8;
+    }
+
+    #body {
+        height: 1fr;
+        padding: 1 2;
+    }
+
+    #sidebar {
+        width: 30;
+        min-width: 28;
+        height: 100%;
+        border: solid #b8b8b8;
+        padding: 1 2;
+    }
+
+    #workspace {
+        width: 1fr;
+        height: 100%;
+        border: solid #b8b8b8;
+        padding: 1 2;
+        margin-left: 2;
+    }
+
+    #identity-panel {
+        height: auto;
+        border: solid #333333;
+        padding: 1 2;
+        margin-bottom: 1;
+    }
+
+    #identity-header {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #identity-title {
+        width: 1fr;
+        color: #ff3b30;
+        text-style: bold;
+        content-align: left middle;
+    }
+
+    #identity-actions {
+        width: auto;
+        height: auto;
+    }
+
+    #identity-actions Button {
+        width: 10;
+        min-width: 8;
+        margin: 0 0 0 1;
+    }
+
+    #identity-fields {
+        layout: grid;
+        grid-size: 3;
+        grid-gutter: 1 2;
+        height: auto;
+    }
+
+    #device-panel {
+        height: auto;
+        border: solid #333333;
+        padding: 1 2;
+        margin-bottom: 1;
+    }
+
+    #device-header {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #device-title {
+        width: 1fr;
+        color: #ff3b30;
+        text-style: bold;
+        content-align: left middle;
+    }
+
+    #scan-devices-inline {
+        width: 10;
+        min-width: 8;
+    }
+
+    #device-state {
+        height: auto;
+        color: #d8d8d8;
+    }
+
+    .field {
+        height: auto;
+    }
+
+    .title {
+        color: #ff3b30;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .section-title {
+        color: #d8d8d8;
+        text-style: bold;
+        margin: 1 0 1 0;
+    }
+
+    .field-label {
+        color: #9a9a9a;
+        margin: 0 0 0 0;
+    }
+
+    Input {
+        height: 1;
+        border: none;
+        padding: 0 1;
+        margin-bottom: 0;
+        width: 100%;
+    }
+
+    #actions {
+        margin-top: 1;
+    }
+
+    #actions Button {
+        width: 100%;
+        margin: 0 0 1 0;
+    }
+
+    #firmware-panel {
+        display: none;
+        height: 1fr;
+        border: solid #333333;
+        padding: 1;
+        background: #0f0f0f;
+    }
+
+    #firmware-actions {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #firmware-title {
+        width: 1fr;
+        color: #ff3b30;
+        text-style: bold;
+        content-align: left middle;
+    }
+
+    #firmware-actions Button {
+        width: 11;
+        min-width: 8;
+        margin-left: 1;
+    }
+
+    #firmware-table {
+        height: 1fr;
+        margin-bottom: 1;
+    }
+
+    #target-device-title {
+        display: none;
+        height: auto;
+        color: #ff3b30;
+        text-style: bold;
+        margin-top: 1;
+    }
+
+    #target-device-table {
+        display: none;
+        height: 5;
+        margin-bottom: 1;
+    }
+
+    #firmware-detail {
+        display: none;
+        height: auto;
+        max-height: 9;
+        color: #d8d8d8;
+    }
+
+    #download-progress-label {
+        display: none;
+        height: auto;
+        color: #c8c8c8;
+        margin-top: 1;
+    }
+
+    #download-progress {
+        display: none;
+        height: 1;
+        margin: 0 0 1 0;
+    }
+
+    #firmware-log-title {
+        display: none;
+        color: #ff3b30;
+        text-style: bold;
+        margin-top: 1;
+    }
+
+    #firmware-log {
+        display: none;
+        height: 5;
+        border: solid #333333;
+        background: #111111;
+        color: #d8d8d8;
+    }
+
+    #status {
+        height: auto;
+        color: #c8c8c8;
+        margin-bottom: 1;
+    }
+
+    #log-title {
+        color: #ff3b30;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #log {
+        height: 1fr;
+        min-height: 8;
+        border: solid #333333;
+        padding: 1;
+        background: #0f0f0f;
+        color: #d8d8d8;
+    }
+    """
+
+    BINDINGS = [
+        ("ctrl+q", "quit", "Quit"),
+        ("1", "login", "Login"),
+        ("2", "dry_run", "Dry run"),
+        ("3", "scan_devices", "Scan"),
+        ("4", "download_rom", "Download"),
+        ("5", "extract_rom", "Extract"),
+        ("6", "flash", "Flash"),
+        ("7", "save_settings", "Save"),
+        ("8", "quit", "Quit"),
+        ("d", "dry_run", "Dry run"),
+        ("p", "download_rom", "Download"),
+        ("s", "save_settings", "Save settings"),
+    ]
+
+    WORKFLOW_LABELS = {
+        "login": ("1. Login / capture token", "1. Login"),
+        "dry-run": ("2. Dry-run rescue flow", "2. Dry run"),
+        "scan-devices": ("3. Scan connected device", "3. Scan"),
+        "download": ("4. Download ROM", "4. Download"),
+        "extract": ("5. Extract ROM", "5. Extract"),
+        "flash": ("6. Flash local firmware", "6. Flash"),
+        "save": ("7. Save settings", "7. Save"),
+        "exit": ("8. Exit", "8. Exit"),
+    }
+
+    def __init__(self, state: MenuState) -> None:
+        super().__init__()
+        self.state = state
+        self.busy = False
+        self.flash_armed = False
+        self.editing_identity = False
+        self.narrow_layout = False
+        self.firmware_task_mode = "download"
+        self.firmware_resources: list[dict] = []
+        self.local_firmware_resources: list[dict[str, str]] = []
+        self.connected_devices: list[dict[str, str]] = []
+        self.selected_firmware_index: int | None = None
+        self.selected_device_index: int | None = None
+        self.firmware_size_cache: dict[int, str] = {}
+
+    @property
+    def identity_input_ids(self) -> tuple[str, ...]:
+        return ("model", "sn", "imei", "imei2")
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="body"):
+            with VerticalScroll(id="sidebar"):
+                yield Static("LRSA", classes="title")
+                yield Static("Workflow Menu", classes="section-title")
+                with Vertical(id="actions"):
+                    yield Button("1. Login / capture token", id="login")
+                    yield Button("2. Dry-run rescue flow", id="dry-run")
+                    yield Button("3. Scan connected device", id="scan-devices")
+                    yield Button("4. Download ROM", id="download")
+                    yield Button("5. Extract ROM", id="extract")
+                    yield Button("6. Flash local firmware", id="flash", variant="error")
+                    yield Button("7. Save settings", id="save", variant="primary")
+                    yield Button("8. Exit", id="exit")
+            with VerticalScroll(id="workspace"):
+                with Vertical(id="identity-panel"):
+                    with Horizontal(id="identity-header"):
+                        yield Static("Device Identity", id="identity-title")
+                        with Horizontal(id="identity-actions"):
+                            yield Button("Edit", id="edit-fields", compact=True)
+                            yield Button(
+                                "Save",
+                                id="save-fields",
+                                variant="primary",
+                                compact=True,
+                                disabled=True,
+                            )
+                            yield Button(
+                                "Revert",
+                                id="revert-fields",
+                                compact=True,
+                                disabled=True,
+                            )
+                    with Grid(id="identity-fields"):
+                        with Vertical(classes="field"):
+                            yield Label("Model", classes="field-label")
+                            yield Input(
+                                value=self.state.model,
+                                id="model",
+                                disabled=True,
+                                compact=True,
+                            )
+                        with Vertical(classes="field"):
+                            yield Label("Serial number", classes="field-label")
+                            yield Input(
+                                value=self.state.sn,
+                                id="sn",
+                                disabled=True,
+                                compact=True,
+                            )
+                        with Vertical(classes="field"):
+                            yield Label("IMEI", classes="field-label")
+                            yield Input(
+                                value=self.state.imei,
+                                id="imei",
+                                disabled=True,
+                                compact=True,
+                            )
+                        with Vertical(classes="field"):
+                            yield Label("IMEI2", classes="field-label")
+                            yield Input(
+                                value=self.state.imei2,
+                                id="imei2",
+                                disabled=True,
+                                compact=True,
+                            )
+                        with Vertical(classes="field"):
+                            yield Label(
+                                "sudo password for Login", classes="field-label"
+                            )
+                            yield Input(password=True, id="sudo-password", compact=True)
+                with Vertical(id="device-panel"):
+                    with Horizontal(id="device-header"):
+                        yield Static("Device State", id="device-title")
+                        yield Button("Scan", id="scan-devices-inline", compact=True)
+                    yield Static("Scanning...", id="device-state")
+                with Vertical(id="firmware-panel"):
+                    with Horizontal(id="firmware-actions"):
+                        yield Static("Select ROM", id="firmware-title")
+                        yield Button("Refresh", id="firmware-refresh", compact=True)
+                        yield Button(
+                            "Download",
+                            id="download-selected",
+                            variant="primary",
+                            compact=True,
+                            disabled=True,
+                        )
+                        yield Button("Back", id="firmware-back", compact=True)
+                    yield DataTable(id="firmware-table", zebra_stripes=True)
+                    yield Static("Target Device", id="target-device-title")
+                    yield DataTable(id="target-device-table", zebra_stripes=True)
+                    yield Static("", id="firmware-detail")
+                    yield Static("", id="download-progress-label")
+                    yield ProgressBar(total=100, id="download-progress")
+                    yield Static("Errors / Activity", id="firmware-log-title")
+                    yield Log(id="firmware-log", highlight=True, max_lines=500)
+                yield Static("", id="status")
+                yield Static("Command Log", id="log-title")
+                yield Log(id="log", highlight=True, max_lines=5000, auto_scroll=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "LRSA"
+        table = self.query_one("#firmware-table", DataTable)
+        table.cursor_type = "row"
+        table.add_column("#", key="index", width=4)
+        table.add_column("Firmware", key="firmware")
+        table.add_column("Model", key="model", width=14)
+        table.add_column("Mode", key="mode", width=12)
+        table.add_column("Published", key="published", width=19)
+        device_table = self.query_one("#target-device-table", DataTable)
+        device_table.cursor_type = "row"
+        device_table.add_column("#", key="index", width=4)
+        device_table.add_column("Mode", key="mode", width=10)
+        device_table.add_column("Serial", key="serial", width=22)
+        device_table.add_column("State", key="state", width=24)
+        device_table.add_column("Detail", key="detail")
+        self.apply_responsive_layout()
+        self.refresh_status()
+        self.refresh_device_scan()
+        self.write_log(
+            "Ready. Mouse wheel, scrollbar, PageUp/PageDown, Home/End work in this log."
+        )
+
+    def on_resize(self) -> None:
+        self.apply_responsive_layout()
+        self.refresh_status()
+
+    def apply_responsive_layout(self) -> None:
+        width, height = self.size
+        narrow = width < 96
+        dense = height < 32
+        tiny = width < 78 or height < 24
+        self.narrow_layout = narrow
+
+        sidebar_width = 22 if tiny else 24 if narrow else 30
+        sidebar = self.query_one("#sidebar", VerticalScroll)
+        workspace = self.query_one("#workspace", VerticalScroll)
+        actions = self.query_one("#actions", Vertical)
+        sidebar.styles.width = sidebar_width
+        workspace.styles.margin = (0, 0, 0, 1 if narrow else 2)
+        workspace.styles.padding = (0, 1) if tiny else (1, 2)
+        actions.styles.margin = (0, 0, 0, 0) if dense else (1, 0, 0, 0)
+        identity_title = self.query_one("#identity-title", Static)
+        identity_title.update("" if narrow else "Device Identity")
+        identity_title.styles.width = 0 if narrow else "1fr"
+
+        for button_id, labels in self.WORKFLOW_LABELS.items():
+            button = self.query_one(f"#{button_id}", Button)
+            button.label = labels[1] if narrow else labels[0]
+            button.compact = dense or narrow
+            button.styles.margin = (0, 0, 0, 0) if dense else (0, 0, 1, 0)
+
+        for button_id in (
+            "edit-fields",
+            "save-fields",
+            "revert-fields",
+            "scan-devices-inline",
+            "firmware-refresh",
+            "download-selected",
+            "firmware-back",
+        ):
+            self.query_one(f"#{button_id}", Button).compact = dense or narrow
+
+    def write_log(self, line: str) -> None:
+        self.query_one("#log", Log).write_line(line)
+
+    def write_firmware_log(self, line: str) -> None:
+        self.query_one("#firmware-log-title").display = True
+        self.query_one("#firmware-log").display = True
+        self.query_one("#firmware-log", Log).write_line(line)
+
+    def clear_log(self, title: str) -> None:
+        self.query_one("#log-title", Static).update(title)
+        self.query_one("#log", Log).clear()
+
+    def clear_firmware_log(self) -> None:
+        self.query_one("#firmware-log", Log).clear()
+        self.query_one("#firmware-log-title").display = False
+        self.query_one("#firmware-log").display = False
+
+    def refresh_status(self) -> None:
+        terminal_size = f"{self.size.width}x{self.size.height}"
+        if self.narrow_layout:
+            status = (
+                f"term={terminal_size} | work={self.state.work_dir} | "
+                f"rom={self.state.firmware_index if self.state.firmware_index is not None else 'not selected'}"
+            )
+        else:
+            status = " | ".join(
+                [
+                    f"Terminal: {terminal_size}",
+                    f"Work: {self.state.work_dir}",
+                    f"Token: {self.state.token_file.name}",
+                    f"Selected ROM: {self.state.firmware_index if self.state.firmware_index is not None else 'not selected'}",
+                ]
+            )
+        self.query_one("#status", Static).update(status)
+
+    def refresh_device_scan(self) -> None:
+        self.query_one("#device-state", Static).update(
+            "Scanning connected device state..."
+        )
+
+        def worker() -> None:
+            try:
+                devices = scan_connected_devices()
+                text = format_device_states(devices)
+            except Exception as exc:
+                text = f"Device scan failed: {exc}"
+            self.call_from_thread(self.set_device_state_text, text)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def set_device_state_text(self, text: str) -> None:
+        self.query_one("#device-state", Static).update(text)
+
+    def sync_inputs_from_state(self) -> None:
+        self.query_one("#model", Input).value = self.state.model
+        self.query_one("#sn", Input).value = self.state.sn
+        self.query_one("#imei", Input).value = self.state.imei
+        self.query_one("#imei2", Input).value = self.state.imei2
+
+    def set_identity_editing(self, editing: bool) -> None:
+        self.editing_identity = editing
+        fields_disabled = self.busy or not editing
+        for input_id in self.identity_input_ids:
+            self.query_one(f"#{input_id}", Input).disabled = fields_disabled
+        self.query_one("#sudo-password", Input).disabled = self.busy
+        self.query_one("#edit-fields", Button).disabled = self.busy or editing
+        self.query_one("#save-fields", Button).disabled = self.busy or not editing
+        self.query_one("#revert-fields", Button).disabled = self.busy or not editing
+        if editing and not self.busy:
+            self.query_one("#model", Input).focus()
+
+    def save_settings_from_inputs(self) -> None:
+        self.state.model = self.query_one("#model", Input).value.strip()
+        self.state.sn = self.query_one("#sn", Input).value.strip()
+        self.state.imei = self.query_one("#imei", Input).value.strip()
+        self.state.imei2 = self.query_one("#imei2", Input).value.strip()
+        save_state(self.state)
+        self.refresh_status()
+
+    def save_identity_edits(self) -> None:
+        self.save_settings_from_inputs()
+        self.set_identity_editing(False)
+        self.write_log("Device identity saved.")
+
+    def revert_identity_edits(self) -> None:
+        self.sync_inputs_from_state()
+        self.set_identity_editing(False)
+        self.write_log("Device identity reverted.")
+
+    def set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        for button in self.query(Button):
+            button.disabled = busy
+        self.set_identity_editing(self.editing_identity)
+        if self.query_one("#firmware-panel").display:
+            self.update_firmware_detail()
+
+    def run_lrsa_args(self, title: str, args: list[str]) -> None:
+        if self.busy:
+            return
+        self.save_settings_from_inputs()
+        self.clear_log(title)
+        self.write_log(quote_lrsa_args(args))
+        self.set_busy(True)
+
+        def worker() -> None:
+            root = logging.getLogger()
+            old_handlers = root.handlers[:]
+            old_level = root.level
+            handler = _TextualLogHandler(self)
+            handler.setFormatter(
+                logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+            )
+            root.handlers = [handler]
+            root.setLevel(logging.INFO)
+            exit_code = 0
+            try:
+                run_lrsa_cli(args)
+            except SystemExit as exc:
+                exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+            except Exception as exc:
+                exit_code = 1
+                self.call_from_thread(self.write_log, f"Error: {exc}")
+            finally:
+                root.handlers = old_handlers
+                root.setLevel(old_level)
+            self.call_from_thread(self.write_log, f"Exit code: {exit_code}")
+            self.call_from_thread(self.set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_main_workspace(self) -> None:
+        self.flash_armed = False
+        self.query_one("#firmware-panel").display = False
+        self.query_one("#status").display = True
+        self.query_one("#log-title").display = True
+        self.query_one("#log").display = True
+
+    def show_firmware_workspace(self) -> None:
+        self.query_one("#firmware-panel").display = True
+        self.query_one("#status").display = False
+        self.query_one("#log-title").display = False
+        self.query_one("#log").display = False
+
+    def reset_download_progress(self) -> None:
+        progress_label = self.query_one("#download-progress-label", Static)
+        progress_label.update("")
+        progress_label.display = False
+        progress = self.query_one("#download-progress", ProgressBar)
+        progress.display = False
+        progress.update(total=100, progress=0)
+
+    def set_download_progress(
+        self, phase: str, completed: int, total: int | None, message: str
+    ) -> None:
+        label = f"{phase.title()}: {message}"
+        if total:
+            if phase == "download":
+                label = f"{label} ({format_bytes(completed)} / {format_bytes(total)})"
+            else:
+                label = f"{label} ({completed} / {total})"
+        progress_label = self.query_one("#download-progress-label", Static)
+        progress_label.display = True
+        progress_label.update(label)
+        progress = self.query_one("#download-progress", ProgressBar)
+        progress.display = True
+        if total:
+            progress.update(total=total, progress=min(completed, total))
+        else:
+            progress.update(total=100, progress=0)
+
+    def open_remote_firmware_picker(self, mode: str) -> None:
+        if self.busy:
+            return
+        if mode not in {"download", "extract"}:
+            raise ValueError(f"Unsupported firmware task mode: {mode}")
+        self.save_settings_from_inputs()
+        self.firmware_task_mode = mode
+        self.flash_armed = False
+        title = "Download ROM" if mode == "download" else "Extract ROM"
+        self.clear_log(title)
+        self.clear_firmware_log()
+        self.reset_download_progress()
+        self.query_one("#target-device-title").display = False
+        self.query_one("#target-device-table").display = False
+        self.query_one("#firmware-title", Static).update(title)
+        self.query_one("#download-selected", Button).label = (
+            "Download" if mode == "download" else "Extract"
+        )
+        self.write_log("Looking up available firmware packages...")
+        self.set_busy(True)
+
+        def worker() -> None:
+            try:
+                payload = refresh_resources_impl(
+                    self.state,
+                    lambda line: self.call_from_thread(self.write_log, line),
+                )
+                self.call_from_thread(self.populate_firmware_picker, payload)
+            except Exception as exc:
+                self.call_from_thread(self.write_log, f"Error: {exc}")
+                self.call_from_thread(self.set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def populate_firmware_picker(self, payload: dict) -> None:
+        resources = content_list(payload)
+        self.firmware_resources = resources
+        self.local_firmware_resources = []
+        self.connected_devices = []
+        self.selected_device_index = None
+        self.firmware_size_cache = {
+            index: size
+            for index, resource in enumerate(resources)
+            if (size := resource_known_size(resource, self.state.work_dir))
+        }
+        self.selected_firmware_index = None
+
+        table = self.query_one("#firmware-table", DataTable)
+        table.clear(columns=False)
+        for index, resource in enumerate(resources):
+            table.add_row(*firmware_table_row(index, resource), key=str(index))
+        detail = self.query_one("#firmware-detail", Static)
+        detail.update("Select a ROM package from the list.")
+        detail.display = False
+        self.query_one("#download-selected", Button).disabled = True
+        self.show_firmware_workspace()
+        self.set_busy(False)
+
+    def open_local_flash_picker(self) -> None:
+        if self.busy:
+            return
+        self.save_settings_from_inputs()
+        self.firmware_task_mode = "flash"
+        self.flash_armed = False
+        self.clear_log("Flash local firmware")
+        self.clear_firmware_log()
+        self.reset_download_progress()
+        self.write_log("Scanning local firmware and connected devices...")
+        self.query_one("#firmware-title", Static).update("Flash firmware")
+        self.query_one("#download-selected", Button).label = "Flash"
+        self.populate_local_flash_picker()
+        self.show_firmware_workspace()
+
+    def populate_local_flash_picker(self) -> None:
+        self.firmware_resources = []
+        self.local_firmware_resources = local_firmware_candidates(self.state)
+        self.connected_devices = scan_connected_devices()
+        self.selected_firmware_index = None
+        self.selected_device_index = None
+        self.firmware_size_cache = {}
+
+        firmware_table = self.query_one("#firmware-table", DataTable)
+        firmware_table.clear(columns=False)
+        for index, candidate in enumerate(self.local_firmware_resources):
+            firmware_table.add_row(
+                str(index),
+                candidate.get("name") or "(unnamed)",
+                candidate.get("source") or "local",
+                "EDL / QFIL",
+                candidate.get("qfil") or "unknown",
+                key=str(index),
+            )
+
+        device_table = self.query_one("#target-device-table", DataTable)
+        device_table.clear(columns=False)
+        for index, device in enumerate(self.connected_devices):
+            device_table.add_row(
+                str(index),
+                str(device.get("transport", "")).upper(),
+                device.get("serial") or "",
+                device.get("state") or "",
+                device.get("detail") or "",
+                key=str(index),
+            )
+
+        self.query_one("#target-device-title").display = True
+        self.query_one("#target-device-table").display = True
+        detail = self.query_one("#firmware-detail", Static)
+        detail.display = True
+        if not self.local_firmware_resources:
+            detail.update(
+                "No locally extracted firmware found. Run Download ROM, then Extract ROM."
+            )
+        elif not self.connected_devices:
+            detail.update(
+                "Select local firmware. No ADB, fastboot, or Qualcomm EDL device detected."
+            )
+        else:
+            detail.update("Select local firmware and target device.")
+        self.update_firmware_action_state()
+
+    def selected_firmware_resource(self) -> dict | None:
+        if self.selected_firmware_index is None:
+            return None
+        if self.selected_firmware_index < 0 or self.selected_firmware_index >= len(
+            self.firmware_resources
+        ):
+            return None
+        return self.firmware_resources[self.selected_firmware_index]
+
+    def selected_local_firmware(self) -> dict[str, str] | None:
+        if self.selected_firmware_index is None:
+            return None
+        if self.selected_firmware_index < 0 or self.selected_firmware_index >= len(
+            self.local_firmware_resources
+        ):
+            return None
+        return self.local_firmware_resources[self.selected_firmware_index]
+
+    def selected_device(self) -> dict[str, str] | None:
+        if self.selected_device_index is None:
+            return None
+        if self.selected_device_index < 0 or self.selected_device_index >= len(
+            self.connected_devices
+        ):
+            return None
+        return self.connected_devices[self.selected_device_index]
+
+    def update_firmware_detail(self) -> None:
+        if self.firmware_task_mode == "flash":
+            candidate = self.selected_local_firmware()
+            device = self.selected_device()
+            detail = self.query_one("#firmware-detail", Static)
+            detail.display = True
+            detail.update(local_firmware_detail_text(candidate, device))
+            self.update_firmware_action_state()
+            return
+        index = self.selected_firmware_index
+        resource = self.selected_firmware_resource()
+        if resource is None:
+            self.query_one("#firmware-detail", Static).display = False
+            self.query_one("#download-selected", Button).disabled = True
+            return
+        size = self.firmware_size_cache.get(index) if index is not None else None
+        detail = self.query_one("#firmware-detail", Static)
+        detail.display = True
+        detail.update(
+            firmware_detail_text(
+                resource,
+                index=index,
+                download_size=size,
+                work_dir=self.state.work_dir,
+            )
+        )
+        rom_url = resource_summary(resource).get("firmwareUrl") if resource else None
+        self.query_one("#download-selected", Button).disabled = self.busy or not bool(
+            rom_url
+        )
+
+    def update_firmware_action_state(self) -> None:
+        button = self.query_one("#download-selected", Button)
+        if self.firmware_task_mode == "flash":
+            button.disabled = (
+                self.busy
+                or self.selected_local_firmware() is None
+                or self.selected_device() is None
+            )
+            return
+        resource = self.selected_firmware_resource()
+        rom_url = resource_summary(resource).get("firmwareUrl") if resource else None
+        button.disabled = self.busy or not bool(rom_url)
+
+    def set_firmware_size(self, index: int, size: str) -> None:
+        self.firmware_size_cache[index] = size
+        if self.selected_firmware_index == index:
+            self.update_firmware_detail()
+
+    def select_firmware_index(self, index: int) -> None:
+        resources_count = (
+            len(self.local_firmware_resources)
+            if self.firmware_task_mode == "flash"
+            else len(self.firmware_resources)
+        )
+        if index < 0 or index >= resources_count:
+            return
+        self.flash_armed = False
+        self.selected_firmware_index = index
+        if self.firmware_task_mode != "flash":
+            self.state.firmware_index = index
+            save_state(self.state)
+            self.refresh_status()
+        self.update_firmware_detail()
+
+    def select_device_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.connected_devices):
+            return
+        self.flash_armed = False
+        self.selected_device_index = index
+        self.update_firmware_detail()
+
+    def run_selected_firmware_task(self) -> None:
+        if self.firmware_task_mode == "flash":
+            self.run_selected_flash()
+            return
+        if self.busy or self.selected_firmware_index is None:
+            return
+        resource = self.selected_firmware_resource()
+        if not resource:
+            self.write_firmware_log("No ROM selected.")
+            return
+        if not is_mobile_or_tablet(resource):
+            self.write_firmware_log(
+                f"Unsupported category for Software Fix flow: {resource.get('category')}"
+            )
+            return
+        self.state.firmware_index = self.selected_firmware_index
+        save_state(self.state)
+        selected_index = self.selected_firmware_index
+        self.clear_firmware_log()
+        self.reset_download_progress()
+        self.set_busy(True)
+        if self.firmware_task_mode == "download":
+            self.write_firmware_log("Downloading selected ROM package...")
+        else:
+            self.write_firmware_log("Extracting selected ROM package...")
+
+        def progress_callback(
+            phase: str, completed: int, total: int | None, message: str
+        ) -> None:
+            self.call_from_thread(
+                self.set_download_progress, phase, completed, total, message
+            )
+
+        def worker() -> None:
+            root = logging.getLogger()
+            old_handlers = root.handlers[:]
+            old_level = root.level
+            handler = _FirmwareLogHandler(self)
+            handler.setFormatter(
+                logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+            )
+            root.handlers = [handler]
+            root.setLevel(logging.INFO)
+            try:
+                manifest = prepare_artifacts(
+                    resource,
+                    self.state.work_dir,
+                    download_rom=self.firmware_task_mode == "download",
+                    extract_rom=self.firmware_task_mode == "extract",
+                    progress_callback=progress_callback,
+                )
+                manifest_path = self.state.work_dir / "software_fix" / "manifest.json"
+                save_json(manifest_path, manifest)
+                size = resource_known_size(resource, self.state.work_dir)
+                if size and selected_index is not None:
+                    self.call_from_thread(self.set_firmware_size, selected_index, size)
+                self.call_from_thread(
+                    self.write_firmware_log,
+                    f"Software Fix manifest saved: {manifest_path}",
+                )
+                if manifest.get("romDir"):
+                    self.call_from_thread(
+                        self.write_firmware_log, f"Extracted ROM: {manifest['romDir']}"
+                    )
+                self.call_from_thread(
+                    self.set_download_progress,
+                    "complete",
+                    1,
+                    1,
+                    "Download complete"
+                    if self.firmware_task_mode == "download"
+                    else "Extract complete",
+                )
+            except Exception as exc:
+                self.call_from_thread(self.write_firmware_log, f"Error: {exc}")
+                self.call_from_thread(
+                    self.set_download_progress, "error", 0, 1, str(exc)
+                )
+            finally:
+                root.handlers = old_handlers
+                root.setLevel(old_level)
+                self.call_from_thread(self.set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_selected_flash(self) -> None:
+        if self.busy:
+            return
+        candidate = self.selected_local_firmware()
+        device = self.selected_device()
+        if not candidate:
+            self.write_firmware_log("No local firmware selected.")
+            return
+        if not device:
+            self.write_firmware_log("No target device selected.")
+            return
+        if device.get("transport") != "edl":
+            self.write_firmware_log(
+                "Selected device is not Qualcomm EDL/QDLoader. Native qfil flashing requires EDL mode."
+            )
+            return
+        if not candidate.get("startup"):
+            self.write_firmware_log(
+                "Selected firmware has no Rescue.cmd or Flash.cmd. Run Extract ROM again or choose another package."
+            )
+            return
+        if not self.flash_armed:
+            self.flash_armed = True
+            self.write_firmware_log(
+                "Flash armed. Press Flash again to write partitions."
+            )
+            return
+
+        self.flash_armed = False
+        self.clear_firmware_log()
+        self.reset_download_progress()
+        self.set_busy(True)
+        self.write_firmware_log("Executing native qfil flash from local firmware...")
+
+        def worker() -> None:
+            root = logging.getLogger()
+            old_handlers = root.handlers[:]
+            old_level = root.level
+            handler = _FirmwareLogHandler(self)
+            handler.setFormatter(
+                logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+            )
+            root.handlers = [handler]
+            root.setLevel(logging.INFO)
+            try:
+                run_local_qfil_flash(candidate, flash=True)
+                self.call_from_thread(
+                    self.set_download_progress, "complete", 1, 1, "Flash complete"
+                )
+            except Exception as exc:
+                self.call_from_thread(self.write_firmware_log, f"Error: {exc}")
+                self.call_from_thread(
+                    self.set_download_progress, "error", 0, 1, str(exc)
+                )
+            finally:
+                root.handlers = old_handlers
+                root.setLevel(old_level)
+                self.call_from_thread(self.set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def focus_device_identity(self) -> None:
+        if self.busy:
+            return
+        self.set_identity_editing(True)
+        self.write_log("Device identity unlocked for editing.")
+
+    def run_capture(self) -> None:
+        if self.busy:
+            return
+        self.save_settings_from_inputs()
+        password = self.query_one("#sudo-password", Input).value
+        self.clear_log("Login / Capture")
+        self.write_log(quote_command(login_command(self.state)))
+        self.set_busy(True)
+
+        def worker() -> None:
+            exit_code = 1
+            try:
+                process = subprocess.Popen(
+                    login_command(self.state),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                if process.stdin is not None:
+                    process.stdin.write(f"{password}\n")
+                    process.stdin.flush()
+                    process.stdin.close()
+                if process.stdout is not None:
+                    for line in process.stdout:
+                        self.call_from_thread(self.write_log, line.rstrip("\n"))
+                exit_code = process.wait()
+            except Exception as exc:
+                self.call_from_thread(self.write_log, f"Error: {exc}")
+            self.call_from_thread(self.write_log, f"Exit code: {exit_code}")
+            self.call_from_thread(self.set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id == "edit-fields":
+            self.show_main_workspace()
+            self.focus_device_identity()
+        elif button_id == "save-fields":
+            self.show_main_workspace()
+            self.save_identity_edits()
+        elif button_id == "revert-fields":
+            self.show_main_workspace()
+            self.revert_identity_edits()
+        elif button_id == "save":
+            self.show_main_workspace()
+            self.save_identity_edits()
+        elif button_id == "dry-run":
+            self.show_main_workspace()
+            self.run_lrsa_args("Dry Run", dry_run_args(self.state))
+        elif button_id == "download":
+            self.open_remote_firmware_picker("download")
+        elif button_id == "extract":
+            self.open_remote_firmware_picker("extract")
+        elif button_id == "login":
+            self.show_main_workspace()
+            self.run_capture()
+        elif button_id in {"scan-devices", "scan-devices-inline"}:
+            self.show_main_workspace()
+            self.refresh_device_scan()
+        elif button_id == "exit":
+            self.exit()
+        elif button_id == "flash":
+            self.open_local_flash_picker()
+        elif button_id == "firmware-refresh":
+            if self.firmware_task_mode == "flash":
+                self.populate_local_flash_picker()
+            else:
+                self.open_remote_firmware_picker(self.firmware_task_mode)
+        elif button_id == "download-selected":
+            self.run_selected_firmware_task()
+        elif button_id == "firmware-back":
+            self.show_main_workspace()
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id not in {"firmware-table", "target-device-table"}:
+            return
+        try:
+            index = int(str(event.row_key.value))
+        except (AttributeError, TypeError, ValueError):
+            index = event.cursor_row
+        if event.data_table.id == "firmware-table":
+            self.select_firmware_index(index)
+        else:
+            self.select_device_index(index)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id not in {"firmware-table", "target-device-table"}:
+            return
+        try:
+            index = int(str(event.row_key.value))
+        except (AttributeError, TypeError, ValueError):
+            index = event.cursor_row
+        if event.data_table.id == "firmware-table":
+            self.select_firmware_index(index)
+        else:
+            self.select_device_index(index)
+
+    def request_flash(self) -> None:
+        self.open_local_flash_picker()
+
+    def action_login(self) -> None:
+        self.show_main_workspace()
+        self.run_capture()
+
+    def action_dry_run(self) -> None:
+        self.show_main_workspace()
+        self.run_lrsa_args("Dry Run", dry_run_args(self.state))
+
+    def action_download_rom(self) -> None:
+        self.open_remote_firmware_picker("download")
+
+    def action_extract_rom(self) -> None:
+        self.open_remote_firmware_picker("extract")
+
+    def action_flash(self) -> None:
+        self.request_flash()
+
+    def action_scan_devices(self) -> None:
+        self.show_main_workspace()
+        self.refresh_device_scan()
+
+    def action_save_settings(self) -> None:
+        self.show_main_workspace()
+        self.save_settings_from_inputs()
+        self.write_log("Settings saved.")
 
 
 def main() -> None:
     state = load_state()
+    if App is not None and sys.stdin.isatty() and sys.stdout.isatty():
+        LRSATextualApp(state).run()
+        return
     if Application is None:
         fallback_main(state)
         return
@@ -1123,7 +3342,7 @@ def main() -> None:
 
     while True:
         choice = choose_item("LRSA Python", menu_text(state), main_items(), "dry_run")
-        if choice in {None, "exit"}:
+        if choice is None or choice == "exit":
             save_state(state)
             return
         handle_choice(choice, state)

@@ -22,13 +22,7 @@ from .api.resources import (
 )
 from .device.flow_checks import validate_fastboot_recipe_checks
 from .device.preflight import format_usb_devices, require_qualcomm_edl_device
-from .flash.boot_chain import (
-    DEFAULT_BOOT_CHAIN_LABELS,
-    format_verify_result,
-    verify_boot_chain,
-)
 from .config import (
-    DEFAULT_EDL,
     DEFAULT_MODEL,
     DEFAULT_SN,
     DEFAULT_STOCK_DIR,
@@ -73,7 +67,7 @@ def resource_match_preflight(
         )
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Run LRSA login -> firmware -> QFIL workflow"
     )
@@ -129,7 +123,6 @@ def main():
     parser.add_argument(
         "--only-login", action="store_true", help="Authenticate, save session, and exit"
     )
-    parser.add_argument("--edl", type=Path, default=DEFAULT_EDL)
     parser.add_argument("--loader", type=Path)
     parser.add_argument(
         "--fastboot",
@@ -152,65 +145,12 @@ def main():
         action="store_true",
         help="Execute the selected flashing flow when supported.",
     )
-    parser.add_argument(
-        "--verify-boot-chain",
-        action="store_true",
-        help="Read back critical boot-chain partitions from EDL and compare with the selected image directory.",
-    )
-    parser.add_argument(
-        "--boot-chain-labels",
-        default=",".join(DEFAULT_BOOT_CHAIN_LABELS),
-        help="Comma-separated labels for --verify-boot-chain.",
-    )
-    parser.add_argument(
-        "--verify-timeout",
-        type=int,
-        default=90,
-        help="Per-partition timeout in seconds for --verify-boot-chain readbacks.",
-    )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.menu:
         from .menu import main as menu_main
 
         menu_main()
-        return
-
-    if args.verify_boot_chain:
-        image_dir = args.image_dir or args.work_dir / "software_fix" / "rom"
-        image_dir = resolve_qfil_image_dir(image_dir)
-        if not image_dir.exists():
-            raise RuntimeError(f"Image directory does not exist: {image_dir}")
-        if not args.edl.exists():
-            raise RuntimeError(f"edl.py not found: {args.edl}")
-        if not args.skip_edl_preflight:
-            devices = require_qualcomm_edl_device()
-            get_logger(__name__).info(
-                f"EDL preflight passed: {format_usb_devices(devices)}"
-            )
-        labels = tuple(
-            part.strip() for part in args.boot_chain_labels.split(",") if part.strip()
-        )
-        get_logger(__name__).info(f"Verifying boot-chain readback against: {image_dir}")
-        get_logger(__name__).info(f"Labels: {', '.join(labels)}")
-        results = verify_boot_chain(
-            image_dir,
-            args.work_dir,
-            args.edl,
-            loader=args.loader,
-            labels=labels,
-            timeout=args.verify_timeout,
-        )
-        output_path = args.work_dir / "boot_chain_verify.json"
-        save_json(output_path, {"imageDir": str(image_dir), "results": results})
-        for result in results:
-            get_logger(__name__).info(format_verify_result(result))
-        failed = [result for result in results if result.get("status") == "FAIL"]
-        get_logger(__name__).info(f"Boot-chain verification saved: {output_path}")
-        if failed:
-            raise RuntimeError(
-                f"{len(failed)} boot-chain partition(s) failed verification."
-            )
         return
 
     token = args.token
