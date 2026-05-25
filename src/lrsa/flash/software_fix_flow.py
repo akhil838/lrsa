@@ -7,11 +7,17 @@ from lrsa.logging import get_logger
 import json
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 from ..api.firmware import download_file, download_json, extract_archive, verify_md5
 from .constants import MOBILE_TABLET_CATEGORIES, QUALCOMM_PLATFORMS
 from .rom_decrypt import decrypt_rom_files
+
+ProgressCallback = Callable[[str, int, int | None, str], None]
+
+
+def dict_value(value: object) -> dict[str, Any]:
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
 
 
 def normalize(value: Any) -> str:
@@ -120,6 +126,7 @@ def prepare_artifacts(
     download_rom: bool = False,
     extract_rom: bool = False,
     decrypt_rom: bool = True,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Download/extract the same artifacts Software Fix references.
 
@@ -131,11 +138,7 @@ def prepare_artifacts(
     rom_dir = work_dir / "software_fix" / "rom"
     flow_path = work_dir / "software_fix" / "flash_flow.json"
 
-    rom = (
-        resource.get("romResource")
-        if isinstance(resource.get("romResource"), dict)
-        else {}
-    )
+    rom = dict_value(resource.get("romResource"))
     result: dict[str, Any] = {
         "category": resource.get("category"),
         "platform": resource.get("platform"),
@@ -147,7 +150,11 @@ def prepare_artifacts(
     }
 
     if resource.get("flashFlow"):
+        if progress_callback:
+            progress_callback("metadata", 0, 1, "Downloading flash flow")
         result["flashFlowPath"] = str(download_json(resource["flashFlow"], flow_path))
+        if progress_callback:
+            progress_callback("metadata", 1, 1, "Flash flow saved")
         flow = load_flow(flow_path)
         result["flashFlowSummary"] = summarize_flow(flow)
         decrypt_file_types = flow_decrypt_file_types(flow)
@@ -168,7 +175,9 @@ def prepare_artifacts(
             )
 
     if download_rom and rom.get("uri"):
-        rom_archive = download_file(rom["uri"], downloads_dir)
+        rom_archive = download_file(
+            rom["uri"], downloads_dir, progress_callback=progress_callback
+        )
         result["romArchive"] = str(rom_archive)
         rom_md5 = verify_md5(rom_archive, rom.get("md5"))
         result["romMd5"] = rom_md5
@@ -177,17 +186,48 @@ def prepare_artifacts(
                 f"ROM MD5 mismatch for {rom_archive}: expected {rom_md5['expected']}, got {rom_md5['actual']}"
             )
         if extract_rom:
+            decrypted = []
             if extracted_rom_has_flash_files(rom_dir):
                 get_logger(__name__).info("Using existing extracted ROM: %s", rom_dir)
+                if progress_callback:
+                    progress_callback("extract", 1, 1, "Using existing extracted ROM")
             else:
-                extract_archive(rom_archive, rom_dir)
+                extract_archive(
+                    rom_archive, rom_dir, progress_callback=progress_callback
+                )
             result["romDir"] = str(rom_dir.resolve())
             if decrypt_rom and decrypt_file_types:
+                if progress_callback:
+                    progress_callback("decrypt", 0, None, "Decrypting ROM files")
                 decrypted = decrypt_rom_files(rom_dir, decrypt_file_types)
-                if decrypted:
-                    result["decryptedFiles"] = [
-                        str(path.resolve()) for path in decrypted
-                    ]
+                if progress_callback:
+                    progress_callback("decrypt", 1, 1, "ROM decrypt complete")
+            if decrypted:
+                result["decryptedFiles"] = [str(path.resolve()) for path in decrypted]
+    elif extract_rom and existing_rom_archive:
+        if extracted_rom_has_flash_files(rom_dir):
+            get_logger(__name__).info("Using existing extracted ROM: %s", rom_dir)
+            if progress_callback:
+                progress_callback("extract", 1, 1, "Using existing extracted ROM")
+        else:
+            extract_archive(
+                existing_rom_archive,
+                rom_dir,
+                progress_callback=progress_callback,
+            )
+        result["romDir"] = str(rom_dir.resolve())
+        if decrypt_rom and decrypt_file_types:
+            if progress_callback:
+                progress_callback("decrypt", 0, None, "Decrypting ROM files")
+            decrypted = decrypt_rom_files(rom_dir, decrypt_file_types)
+            if progress_callback:
+                progress_callback("decrypt", 1, 1, "ROM decrypt complete")
+            if decrypted:
+                result["decryptedFiles"] = [str(path.resolve()) for path in decrypted]
+    elif extract_rom and not existing_rom_archive:
+        raise RuntimeError(
+            "ROM archive is not downloaded yet. Run Download ROM before Extract ROM."
+        )
     elif extracted_rom_has_flash_files(rom_dir):
         result["romDir"] = str(rom_dir.resolve())
         if decrypt_rom and decrypt_file_types:

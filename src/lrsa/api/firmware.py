@@ -6,12 +6,15 @@ import shutil
 import urllib.parse
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 import requests
 from tqdm.auto import tqdm
 
 from lrsa.logging import get_logger
 from lrsa.process import run_process
+
+ProgressCallback = Callable[[str, int, int | None, str], None]
 
 
 def file_md5(path):
@@ -163,7 +166,7 @@ def response_payload(result):
         return raw
 
 
-def download_file(url, output_dir):
+def download_file(url, output_dir, progress_callback: ProgressCallback | None = None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     name = (
@@ -174,6 +177,9 @@ def download_file(url, output_dir):
     if output.exists() and output.stat().st_size > 0:
         if archive_looks_readable(output):
             get_logger(__name__).info("Using existing download: %s", output)
+            if progress_callback:
+                size = output.stat().st_size
+                progress_callback("download", size, size, f"Using existing {name}")
             return output
         quarantine_download(output, "invalid archive")
 
@@ -182,6 +188,9 @@ def download_file(url, output_dir):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length") or 0)
+        downloaded = 0
+        if progress_callback:
+            progress_callback("download", 0, total or None, name)
         progress = tqdm(
             total=total or None,
             unit="B",
@@ -193,7 +202,10 @@ def download_file(url, output_dir):
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+                    downloaded += len(chunk)
                     progress.update(len(chunk))
+                    if progress_callback:
+                        progress_callback("download", downloaded, total or None, name)
     partial.replace(output)
     if not archive_looks_readable(output):
         quarantine_download(output, "downloaded file is not a valid archive")
@@ -216,7 +228,9 @@ def download_json(url, output):
     return output
 
 
-def extract_archive(archive, output_dir):
+def extract_archive(
+    archive, output_dir, progress_callback: ProgressCallback | None = None
+):
     archive = Path(archive)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -227,17 +241,28 @@ def extract_archive(archive, output_dir):
             get_logger(__name__).info(
                 "Extracting archive: %s -> %s", archive, output_dir
             )
-            for member in tqdm(members, desc=f"Extract {archive.name}", unit="file"):
+            total = len(members)
+            if progress_callback:
+                progress_callback("extract", 0, total, archive.name)
+            for index, member in enumerate(
+                tqdm(members, desc=f"Extract {archive.name}", unit="file"), 1
+            ):
                 zf.extract(member, output_dir)
+                if progress_callback:
+                    progress_callback("extract", index, total, member.filename)
         return output_dir
 
     seven_zip = shutil.which("7z")
     if seven_zip:
+        if progress_callback:
+            progress_callback("extract", 0, None, archive.name)
         run_process(
             [seven_zip, "x", str(archive), f"-o{output_dir}", "-y"],
             label="7z extract",
             logger=get_logger(__name__),
         )
+        if progress_callback:
+            progress_callback("extract", 1, 1, archive.name)
         return output_dir
 
     raise RuntimeError(
