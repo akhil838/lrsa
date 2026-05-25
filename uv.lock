@@ -394,9 +394,10 @@ wheels = [
 [[package]]
 name = "qfil"
 version = "0.1.0"
-source = { git = "https://github.com/akhil838/qfil.git#d0bb6d1b90c13361ea64027e8c83b2a868a5b3e1" }
+source = { git = "https://github.com/akhil838/qfil.git#99df4691856c1bcd0f6d8737a54c99ca02d2c0a1" }
 dependencies = [
     { name = "pyusb" },
+    { name = "tqdm" },
 ]
 
 [[package]]
