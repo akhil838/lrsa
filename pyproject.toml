@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lrsa"
+version = "0.1.0"
+description = "Native Python Lenovo Software Fix / LRSA rescue workflow"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31",
+  "urllib3>=2.0",
+  "pycryptodome>=3.20",
+  "dnfile>=0.15",
+  "pyusb>=1.1.0",
+  "pyserial>=3.4",
+  "docopt>=0.6.2",
+  "lxml>=4.6.1",
+  "colorama>=0.4.6",
+  "prompt_toolkit>=3.0.0",
+  "qfil @ git+https://github.com/akhil838/qfil.git",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.14.0",
+  "ty>=0.0.1a20",
+]
+
+[project.scripts]
+lrsa = "lrsa.cli:main"
+lrsa-menu = "lrsa.menu:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lrsa*"]
+
+[tool.uv]
+package = true

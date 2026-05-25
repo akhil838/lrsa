@@ -1,0 +1,362 @@
+"""Software Fix style firmware artifact preparation and flow inspection."""
+
+from __future__ import annotations
+
+import json
+import re
+import shlex
+import shutil
+from pathlib import Path
+from typing import Any
+
+from .firmware import download_file, download_json, extract_archive, verify_md5
+from .rom_decrypt import decrypt_rom_files
+
+MOBILE_TABLET_CATEGORIES = {"phone", "mobile", "tablet", "smart", "smart device"}
+QUALCOMM_PLATFORMS = {"qcom", "qualcomm"}
+WHISKY_CMD = Path("/Applications/Whisky.app/Contents/Resources/WhiskyCmd")
+DEFAULT_WHISKY_BOTTLE = "Bottle 1"
+
+
+def normalize(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def is_mobile_or_tablet(resource: dict[str, Any]) -> bool:
+    return normalize(resource.get("category")) in MOBILE_TABLET_CATEGORIES
+
+
+def is_qualcomm(resource: dict[str, Any]) -> bool:
+    return normalize(resource.get("platform")) in QUALCOMM_PLATFORMS
+
+
+def load_flow(path: Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def flow_shell_steps(flow: dict[str, Any]) -> list[dict[str, Any]]:
+    return [step for step in flow.get("Steps", []) if step.get("Step") == "Shell"]
+
+
+def flow_decrypt_file_types(flow: dict[str, Any]) -> str | None:
+    for step in flow_shell_steps(flow):
+        decrypt_file_type = (step.get("Args") or {}).get("DecryptFileType")
+        if decrypt_file_type:
+            return str(decrypt_file_type)
+    return None
+
+
+def summarize_flow(flow: dict[str, Any]) -> list[str]:
+    lines = [
+        f"{flow.get('Name', 'Unknown flow')} ({flow.get('UseCase', 'unknown use case')})"
+    ]
+    for idx, step in enumerate(flow.get("Steps", []), 1):
+        args = step.get("Args") or {}
+        detail = []
+        if args.get("FlashToolType"):
+            detail.append(f"tool={args['FlashToolType']}")
+        if args.get("StartupFile"):
+            detail.append(f"startup={args['StartupFile']}")
+        if args.get("ComPorts"):
+            detail.append(f"ports={','.join(args['ComPorts'])}")
+        suffix = f" [{'; '.join(detail)}]" if detail else ""
+        lines.append(f"{idx}. {step.get('Step')}: {step.get('Name')}{suffix}")
+    return lines
+
+
+def find_tool_executable(tool_dir: Path, name: str) -> Path | None:
+    matches = sorted(tool_dir.rglob(name))
+    return matches[0] if matches else None
+
+
+def find_startup_file(root: Path, flow: dict[str, Any]) -> Path | None:
+    for step in flow_shell_steps(flow):
+        startup = (step.get("Args") or {}).get("StartupFile")
+        if startup:
+            matches = sorted(root.rglob(startup))
+            if matches:
+                return matches[0]
+    return None
+
+
+def flow_startup_names(flow: dict[str, Any]) -> list[str]:
+    names = []
+    for step in flow_shell_steps(flow):
+        startup = (step.get("Args") or {}).get("StartupFile")
+        if startup and startup not in names:
+            names.append(startup)
+    for fallback in ("Rescue.cmd", "Flash.cmd"):
+        if fallback not in names:
+            names.append(fallback)
+    return names
+
+
+def normalize_com_port(com_port: str | None) -> str:
+    value = str(com_port or "").strip()
+    if not value:
+        return "comport"
+    return value if value.upper().startswith("COM") else f"COM{value}"
+
+
+def find_matching_tool_file(tool_dir: Path, pattern: str) -> Path | None:
+    pattern = pattern.strip().strip('"')
+    if not pattern:
+        return None
+
+    matches = sorted(Path(tool_dir).rglob(pattern))
+    if matches:
+        return matches[0]
+
+    lowered = pattern.lower()
+    for path in sorted(Path(tool_dir).rglob("*")):
+        if path.is_file() and path.name.lower() == lowered:
+            return path
+    return None
+
+
+def split_windows_args(arguments: str) -> list[str]:
+    if not arguments.strip():
+        return []
+    return [part.strip('"') for part in shlex.split(arguments, posix=False)]
+
+
+def whisky_windows_path(path: Path) -> str:
+    path = Path(path)
+    if path.is_absolute():
+        return "Z:" + str(path).replace("/", "\\")
+    return str(path).replace("/", "\\")
+
+
+def parse_startup_commands(
+    startup_file: Path, tool_dir: Path, com_port: str | None = None
+) -> list[dict[str, Any]]:
+    """Parse Software Fix Rescue.cmd/Flash.cmd into executable invocations.
+
+    The installed app reads the startup file, replaces %~dp0 with the ROM
+    folder, replaces .\\portname with the detected COM port, then treats the
+    first space-delimited token on each line as the flash tool executable
+    pattern and the rest as that tool's arguments.
+    """
+    startup_file = Path(startup_file)
+    tool_dir = Path(tool_dir)
+    startup_dir = whisky_windows_path(startup_file.parent) + "\\"
+    port = normalize_com_port(com_port)
+
+    text = startup_file.read_text(encoding="utf-8", errors="ignore").strip()
+    text = re.sub(
+        re.escape("%~dp0"), lambda _: startup_dir, text, flags=re.IGNORECASE
+    ).strip()
+    text = re.sub("pause", "", text, flags=re.IGNORECASE).strip()
+    text = text.replace(".\\portname", ".\\" + port)
+
+    commands: list[dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith(("rem ", "::", "@echo")):
+            continue
+        if " " not in line:
+            continue
+
+        exe_pattern, arguments = line.split(" ", 1)
+        executable = find_matching_tool_file(tool_dir, exe_pattern)
+        commands.append(
+            {
+                "line": line,
+                "exePattern": exe_pattern,
+                "executable": str(executable.resolve()) if executable else None,
+                "arguments": arguments.strip(),
+                "argv": split_windows_args(arguments),
+                "comPort": port,
+            }
+        )
+    return commands
+
+
+def startup_requires_com_port(commands: list[dict[str, Any]]) -> bool:
+    for command in commands:
+        line = command.get("line") or ""
+        if ".\\comport" in line.lower() or "portname" in line.lower():
+            return True
+    return False
+
+
+def resource_filename(resource_info: dict[str, Any]) -> str | None:
+    name = resource_info.get("name")
+    if name:
+        return str(name)
+    uri = resource_info.get("uri")
+    if not uri:
+        return None
+    from urllib.parse import unquote, urlparse
+
+    return Path(unquote(urlparse(str(uri)).path)).name or None
+
+
+def find_existing_archive(
+    downloads_dir: Path, resource_info: dict[str, Any]
+) -> Path | None:
+    filename = resource_filename(resource_info)
+    if not filename:
+        return None
+    path = Path(downloads_dir) / filename
+    if path.exists() and path.stat().st_size > 0:
+        return path
+    return None
+
+
+def extracted_rom_has_flash_files(path: Path) -> bool:
+    path = Path(path)
+    if not path.exists():
+        return False
+    return any(path.rglob("rawprogram*.xml")) and any(path.rglob("patch*.xml"))
+
+
+def prepare_artifacts(
+    resource: dict[str, Any],
+    work_dir: Path,
+    download_rom: bool = False,
+    extract_rom: bool = False,
+    download_tool: bool = True,
+    extract_tool: bool = True,
+    com_port: str | None = None,
+    decrypt_rom: bool = True,
+) -> dict[str, Any]:
+    """Download/extract the same artifacts Software Fix references.
+
+    This prepares the package; it intentionally does not invent a missing
+    Rescue.cmd. Execution should follow the downloaded flashFlow metadata.
+    """
+    work_dir = Path(work_dir)
+    downloads_dir = work_dir / "software_fix" / "downloads"
+    tools_dir = work_dir / "software_fix" / "tools"
+    rom_dir = work_dir / "software_fix" / "rom"
+    flow_path = work_dir / "software_fix" / "flash_flow.json"
+
+    rom = (
+        resource.get("romResource")
+        if isinstance(resource.get("romResource"), dict)
+        else {}
+    )
+    tool = (
+        resource.get("toolResource")
+        if isinstance(resource.get("toolResource"), dict)
+        else {}
+    )
+    result: dict[str, Any] = {
+        "category": resource.get("category"),
+        "platform": resource.get("platform"),
+        "modelName": resource.get("modelName"),
+        "marketName": resource.get("marketName"),
+        "romName": rom.get("name"),
+        "romUrl": rom.get("uri"),
+        "toolName": tool.get("name"),
+        "toolUrl": tool.get("uri"),
+        "flashFlowUrl": resource.get("flashFlow"),
+    }
+
+    if resource.get("flashFlow"):
+        result["flashFlowPath"] = str(download_json(resource["flashFlow"], flow_path))
+        flow = load_flow(flow_path)
+        result["flashFlowSummary"] = summarize_flow(flow)
+        decrypt_file_types = flow_decrypt_file_types(flow)
+        if decrypt_file_types:
+            result["decryptFileType"] = decrypt_file_types
+    else:
+        flow = {}
+        decrypt_file_types = None
+
+    if download_tool and tool.get("uri"):
+        tool_archive = download_file(tool["uri"], downloads_dir)
+        result["toolArchive"] = str(tool_archive)
+        tool_md5 = verify_md5(tool_archive, tool.get("md5"))
+        result["toolMd5"] = tool_md5
+        if tool_md5["verified"] is False:
+            raise RuntimeError(
+                f"Tool MD5 mismatch for {tool_archive}: expected {tool_md5['expected']}, got {tool_md5['actual']}"
+            )
+        if extract_tool:
+            extract_archive(tool_archive, tools_dir)
+            result["toolDir"] = str(tools_dir.resolve())
+            qfil = find_tool_executable(tools_dir, "QFIL.exe")
+            if qfil:
+                result["qfilExe"] = str(qfil.resolve())
+
+    existing_rom_archive = find_existing_archive(downloads_dir, rom)
+    if existing_rom_archive:
+        result["romArchive"] = str(existing_rom_archive)
+        rom_md5 = verify_md5(existing_rom_archive, rom.get("md5"))
+        result["romMd5"] = rom_md5
+        if rom_md5["verified"] is False:
+            raise RuntimeError(
+                f"ROM MD5 mismatch for {existing_rom_archive}: expected {rom_md5['expected']}, got {rom_md5['actual']}"
+            )
+
+    if download_rom and rom.get("uri"):
+        rom_archive = download_file(rom["uri"], downloads_dir)
+        result["romArchive"] = str(rom_archive)
+        rom_md5 = verify_md5(rom_archive, rom.get("md5"))
+        result["romMd5"] = rom_md5
+        if rom_md5["verified"] is False:
+            raise RuntimeError(
+                f"ROM MD5 mismatch for {rom_archive}: expected {rom_md5['expected']}, got {rom_md5['actual']}"
+            )
+        if extract_rom:
+            if extracted_rom_has_flash_files(rom_dir):
+                print(f"Using existing extracted ROM: {rom_dir}", flush=True)
+            else:
+                extract_archive(rom_archive, rom_dir)
+            result["romDir"] = str(rom_dir.resolve())
+            if decrypt_rom and decrypt_file_types:
+                decrypted = decrypt_rom_files(rom_dir, decrypt_file_types)
+                if decrypted:
+                    result["decryptedFiles"] = [
+                        str(path.resolve()) for path in decrypted
+                    ]
+    elif extracted_rom_has_flash_files(rom_dir):
+        result["romDir"] = str(rom_dir.resolve())
+        if decrypt_rom and decrypt_file_types:
+            decrypted = decrypt_rom_files(rom_dir, decrypt_file_types)
+            if decrypted:
+                result["decryptedFiles"] = [str(path.resolve()) for path in decrypted]
+
+    startup = find_startup_file(work_dir / "software_fix", flow) if flow else None
+    if startup:
+        result["startupFile"] = str(startup)
+        if result.get("toolDir"):
+            commands = parse_startup_commands(
+                startup, Path(result["toolDir"]), com_port
+            )
+            result["startupCommands"] = commands
+            result["startupRequiresComPort"] = startup_requires_com_port(commands)
+            missing_tools = [
+                cmd["exePattern"] for cmd in commands if not cmd.get("executable")
+            ]
+            if missing_tools:
+                result["missingStartupTools"] = missing_tools
+    elif flow:
+        result["expectedStartupFiles"] = flow_startup_names(flow)
+
+    return result
+
+
+def whisky_command(
+    executable: Path, bottle: str = DEFAULT_WHISKY_BOTTLE, *args: str
+) -> list[str]:
+    return [str(WHISKY_CMD), "run", bottle, str(executable), *args]
+
+
+def copy_existing_rom_package(source_dir: Path, work_dir: Path) -> Path:
+    target = Path(work_dir) / "software_fix" / "rom"
+    target.mkdir(parents=True, exist_ok=True)
+    source_dir = Path(source_dir)
+    if source_dir.resolve() == target.resolve():
+        return target
+    for item in source_dir.iterdir():
+        dest = target / item.name
+        if item.is_dir():
+            if not dest.exists():
+                shutil.copytree(item, dest)
+        elif not dest.exists():
+            shutil.copy2(item, dest)
+    return target
