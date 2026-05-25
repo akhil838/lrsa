@@ -1,4 +1,6 @@
-"""Authentication helpers for the LRSA standalone workflow."""
+"""Authentication helpers for LRSA workflows."""
+
+from lrsa.logging import get_logger
 
 import json
 import os
@@ -42,8 +44,8 @@ def lenovo_id_login(open_browser=True):
     state = os.urandom(16).hex()
     auth_url = build_auth_url(state, challenge)
 
-    print("\nLenovo ID login URL:")
-    print(auth_url)
+    get_logger(__name__).info("\nLenovo ID login URL:")
+    get_logger(__name__).info(auth_url)
     if open_browser:
         webbrowser.open(auth_url)
 
@@ -55,7 +57,7 @@ def lenovo_id_login(open_browser=True):
     scope = parsed.get("scope", ["openid"])[0]
     callback_state = parsed.get("state", [state])[0]
 
-    from .client import LRSAClient
+    from ..api.client import LRSAClient
 
     client = LRSAClient()
     callback_result = client.lenovo_id_oauth_callback(

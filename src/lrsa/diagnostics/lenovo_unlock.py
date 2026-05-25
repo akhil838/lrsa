@@ -7,14 +7,12 @@ Lenovo ABL expects to find in the unlock/lenovolock partition.
 
 from __future__ import annotations
 
+from lrsa.logging import get_logger
+
 import argparse
 from pathlib import Path
 
-
-ZUX_MAGIC = b"1a2blenovo3c4d5e"
-ZUX_IMAGE_SIZE = 100 + 256
-ZUX_SERIAL_OFFSET = 0x24
-ZUX_SERIAL_LEN = 64
+from .constants import ZUX_IMAGE_SIZE, ZUX_MAGIC, ZUX_SERIAL_LEN, ZUX_SERIAL_OFFSET
 
 
 def normalize_bootloader_sn(value: str) -> str:
@@ -67,7 +65,7 @@ def main() -> None:
     args = parser.parse_args()
 
     out = write_zux_unlock_image(args.bootloader_sn, args.output)
-    print(f"Saved: {out}")
+    get_logger(__name__).info(f"Saved: {out}")
 
 
 if __name__ == "__main__":

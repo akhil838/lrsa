@@ -6,6 +6,8 @@ version of this port talked to ``/lmsa-web`` and sent raw endpoint payloads,
 which is why most calls were redirected or rejected.
 """
 
+from lrsa.logging import get_logger
+
 import argparse
 import base64
 import json
@@ -16,9 +18,9 @@ import uuid
 import requests
 import urllib3
 
-from .crypto import LRSACrypto
 from . import endpoints
-from .config import BASE_URL, CLIENT_VERSION, DEFAULT_LANGUAGE, DEFAULT_WINDOWS_VERSION
+from ..config import BASE_URL, CLIENT_VERSION, DEFAULT_LANGUAGE, DEFAULT_WINDOWS_VERSION
+from ..core import LRSACrypto
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -353,9 +355,9 @@ class LRSAClient:
 
     def probe_all(self, model="Lenovo TB390FU", sn="HNQ06MHH"):
         """Probe all known endpoints and report results."""
-        print(f"Probing LRSA API for model={model}, sn={sn}")
-        print(f"Base URL: {self.base_url}")
-        print(f"Client UUID: {self.client_uuid}\n")
+        get_logger(__name__).info(f"Probing LRSA API for model={model}, sn={sn}")
+        get_logger(__name__).info(f"Base URL: {self.base_url}")
+        get_logger(__name__).info(f"Client UUID: {self.client_uuid}\n")
 
         tests = [
             ("RSA Key", self.get_rsa_key),
@@ -372,33 +374,39 @@ class LRSAClient:
         ]
 
         for name, fn in tests:
-            print(f"{'─' * 50}")
-            print(f"Testing: {name}")
+            get_logger(__name__).info(f"{'─' * 50}")
+            get_logger(__name__).info(f"Testing: {name}")
             try:
                 result = fn()
                 status = result["status"]
                 indicator = "+" if status == 200 else ">" if status == 302 else "-"
-                print(f"  {indicator} Status: {status}")
+                get_logger(__name__).info(f"  {indicator} Status: {status}")
                 if result.get("json"):
-                    print(f"  JSON: {json.dumps(result['json'], indent=4)[:500]}")
+                    get_logger(__name__).info(
+                        f"  JSON: {json.dumps(result['json'], indent=4)[:500]}"
+                    )
                 elif result.get("decrypted"):
-                    print(f"  Decrypted: {result['decrypted'][:500]}")
+                    get_logger(__name__).info(
+                        f"  Decrypted: {result['decrypted'][:500]}"
+                    )
                 elif result.get("raw") and len(result["raw"]) < 200:
-                    print(f"  Raw: {result['raw']}")
+                    get_logger(__name__).info(f"  Raw: {result['raw']}")
                 elif status == 302:
-                    print(f"  Redirect: {result['headers'].get('Location', 'unknown')}")
+                    get_logger(__name__).info(
+                        f"  Redirect: {result['headers'].get('Location', 'unknown')}"
+                    )
             except Exception as e:
-                print(f"  Error: {e}")
+                get_logger(__name__).info(f"  Error: {e}")
 
 
 def _print_result(result):
-    print(f"Status: {result['status']}")
+    get_logger(__name__).info(f"Status: {result['status']}")
     if result.get("json") is not None:
-        print(json.dumps(result["json"], indent=2))
+        get_logger(__name__).info(json.dumps(result["json"], indent=2))
     elif result.get("decrypted"):
-        print(result["decrypted"])
+        get_logger(__name__).info(result["decrypted"])
     else:
-        print(result["raw"][:2000])
+        get_logger(__name__).info(result["raw"][:2000])
 
 
 def main():
@@ -425,10 +433,10 @@ def main():
 
     if args.action == "bootstrap":
         for name, result in client.bootstrap_guest_session():
-            print(f"\n{name}")
+            get_logger(__name__).info(f"\n{name}")
             _print_result(result)
         if client.token:
-            print(f"\nToken: {client.token}")
+            get_logger(__name__).info(f"\nToken: {client.token}")
     elif args.action == "rescue-rom":
         _print_result(client.get_rescue_rom(args.model, args.sn))
     elif args.action == "rom-match":

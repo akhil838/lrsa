@@ -19,6 +19,7 @@ dependencies = [
   "lxml>=4.6.1",
   "colorama>=0.4.6",
   "prompt_toolkit>=3.0.0",
+  "tqdm>=4.66",
   "qfil @ git+https://github.com/akhil838/qfil.git",
 ]
 

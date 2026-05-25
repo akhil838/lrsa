@@ -3,36 +3,20 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
+from lrsa.logging import get_logger
+from lrsa.process import run_process
+
+from .constants import DEFAULT_BOOT_CHAIN_LABELS
 from .qfil import (
     discover_firehose_loader,
     discover_qfil_files,
     resolve_qfil_image_dir,
     select_qfil_set,
-)
-
-DEFAULT_BOOT_CHAIN_LABELS = (
-    "xbl_a",
-    "xbl_b",
-    "xbl_config_a",
-    "xbl_config_b",
-    "abl_a",
-    "abl_b",
-    "uefi_a",
-    "uefi_b",
-    "tz_a",
-    "tz_b",
-    "hyp_a",
-    "hyp_b",
-    "vbmeta_a",
-    "vbmeta_b",
-    "vbmeta_system_a",
-    "vbmeta_system_b",
 )
 
 
@@ -176,7 +160,21 @@ def read_partition(
         "--vid=0x05c6",
         "--pid=0x9008",
     ]
-    subprocess.run(command, cwd=Path(edl).parent, check=True, timeout=timeout)
+    get_logger(__name__).info(
+        "Reading %s through EDL: lun=%s sector=%s sectors=%s -> %s",
+        entry.label,
+        entry.lun,
+        entry.start_sector,
+        entry.sectors,
+        out_path,
+    )
+    run_process(
+        command,
+        cwd=Path(edl).parent,
+        timeout=timeout,
+        label=f"EDL readback {entry.label}",
+        logger=get_logger(__name__),
+    )
 
 
 def verify_boot_chain(

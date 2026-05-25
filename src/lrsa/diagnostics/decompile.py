@@ -4,14 +4,13 @@ Extract .NET IL metadata, method signatures, and string literals from LRSA DLLs.
 Focus on auth flow: RSA key exchange → token init → session management.
 """
 
+from lrsa.logging import get_logger
+
 import argparse
 import dnfile
 import os
 
-DEFAULT_LRSA_DIR = (
-    "/Users/akhilkosuri/Library/Containers/com.franke.Whisky/Bottles/"
-    "592A72E2-14B8-4B26-8EF9-8FF81ED88D65/drive_c/Program Files/Software Fix"
-)
+from .constants import DEFAULT_LRSA_DIR
 
 
 def extract_user_strings(filepath):
@@ -114,13 +113,13 @@ def main():
             continue
 
         name = os.path.basename(dll_rel)
-        print(f"\n{'=' * 70}")
-        print(f"Analyzing: {name}")
-        print(f"{'=' * 70}")
+        get_logger(__name__).info(f"\n{'=' * 70}")
+        get_logger(__name__).info(f"Analyzing: {name}")
+        get_logger(__name__).info(f"{'=' * 70}")
 
         info = analyze_dll(filepath)
         if not info:
-            print("  Failed to parse")
+            get_logger(__name__).info("  Failed to parse")
             continue
 
         # Show types related to auth/API
@@ -154,9 +153,9 @@ def main():
             )
         ]
         if auth_types:
-            print(f"\n  Key Types ({len(auth_types)}):")
+            get_logger(__name__).info(f"\n  Key Types ({len(auth_types)}):")
             for t in sorted(set(auth_types)):
-                print(f"    {t}")
+                get_logger(__name__).info(f"    {t}")
 
         # Show methods related to auth
         auth_methods = [
@@ -188,9 +187,9 @@ def main():
             )
         ]
         if auth_methods:
-            print(f"\n  Key Methods ({len(auth_methods)}):")
+            get_logger(__name__).info(f"\n  Key Methods ({len(auth_methods)}):")
             for m in sorted(set(auth_methods)):
-                print(f"    {m}")
+                get_logger(__name__).info(f"    {m}")
 
         # Show all string literals (these are the goldmine)
         if info["strings"]:
@@ -227,16 +226,20 @@ def main():
                 )
             ]
             if relevant:
-                print(f"\n  Relevant String Literals ({len(relevant)}):")
+                get_logger(__name__).info(
+                    f"\n  Relevant String Literals ({len(relevant)}):"
+                )
                 for s in sorted(set(relevant)):
-                    print(f'    "{s}"')
+                    get_logger(__name__).info(f'    "{s}"')
 
             # Also show ALL strings for small DLLs
             if len(info["strings"]) < 100:
-                print(f"\n  ALL String Literals ({len(info['strings'])}):")
+                get_logger(__name__).info(
+                    f"\n  ALL String Literals ({len(info['strings'])}):"
+                )
                 for s in sorted(set(info["strings"])):
                     if len(s) > 2:
-                        print(f'    "{s}"')
+                        get_logger(__name__).info(f'    "{s}"')
 
 
 if __name__ == "__main__":

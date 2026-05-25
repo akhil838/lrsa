@@ -9,9 +9,7 @@ from pathlib import Path
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
-DEFAULT_DECRYPT_PASSWORD = "OSD"
-MAGIC = 0xFC010203040506CF
-BUFFER_SIZE = 128 * 1024
+from .constants import DEFAULT_DECRYPT_PASSWORD, ROM_DECRYPT_MAGIC
 
 
 def password_derive_bytes_sha256(
@@ -63,7 +61,7 @@ def decrypt_file(
         raise ValueError(f"Decrypted payload is too small: {source}")
     size = struct.unpack_from("<q", payload, 0)[0]
     magic = struct.unpack_from("<Q", payload, 8)[0]
-    if magic != MAGIC:
+    if magic != ROM_DECRYPT_MAGIC:
         raise ValueError(f"Encrypted file magic mismatch: {source}")
 
     start = 16

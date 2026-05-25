@@ -3,13 +3,15 @@
 import json
 import hashlib
 import shutil
-import subprocess
-import time
 import urllib.parse
 import zipfile
 from pathlib import Path
 
 import requests
+from tqdm.auto import tqdm
+
+from lrsa.logging import get_logger
+from lrsa.process import run_process
 
 
 def file_md5(path):
@@ -34,29 +36,6 @@ def verify_md5(path, expected):
     }
 
 
-def format_bytes(count):
-    count = float(count or 0)
-    for unit in ("B", "KB", "MB", "GB"):
-        if count < 1024 or unit == "GB":
-            return f"{count:.1f} {unit}" if unit != "B" else f"{int(count)} B"
-        count /= 1024
-    return f"{count:.1f} GB"
-
-
-def format_download_progress(done, total, started_at):
-    elapsed = max(0.001, time.monotonic() - started_at)
-    speed = done / elapsed
-    if total:
-        percent = min(100.0, done * 100 / total)
-        filled = int(percent // 5)
-        bar = "#" * filled + "." * (20 - filled)
-        return (
-            f"Progress: [{bar}] {percent:5.1f}% "
-            f"{format_bytes(done)} / {format_bytes(total)}  {format_bytes(speed)}/s"
-        )
-    return f"Progress: {format_bytes(done)} downloaded  {format_bytes(speed)}/s"
-
-
 def archive_looks_readable(path):
     suffixes = "".join(Path(path).suffixes).lower()
     if suffixes.endswith(".zip"):
@@ -76,7 +55,9 @@ def quarantine_download(path, reason):
         target = path.with_name(f"{path.name}.bad{index}")
         index += 1
     path.replace(target)
-    print(f"Cached download is not usable ({reason}); moved to: {target}", flush=True)
+    get_logger(__name__).warning(
+        "Cached download is not usable (%s); moved to: %s", reason, target
+    )
 
 
 def recursive_find_urls(value):
@@ -192,50 +173,46 @@ def download_file(url, output_dir):
     output = output_dir / name
     if output.exists() and output.stat().st_size > 0:
         if archive_looks_readable(output):
-            print(f"Using existing download: {output}")
+            get_logger(__name__).info("Using existing download: %s", output)
             return output
         quarantine_download(output, "invalid archive")
 
-    print(f"Downloading: {url}")
+    get_logger(__name__).info("Downloading firmware: %s", url)
     partial = output.with_name(f"{output.name}.part")
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length") or 0)
-        downloaded = 0
-        started_at = time.monotonic()
-        last_print = 0.0
-        with open(partial, "wb") as f:
+        progress = tqdm(
+            total=total or None,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=name,
+        )
+        with open(partial, "wb") as f, progress:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.monotonic()
-                    if now - last_print >= 1:
-                        print(
-                            format_download_progress(downloaded, total, started_at),
-                            flush=True,
-                        )
-                        last_print = now
-        print(format_download_progress(downloaded, total, started_at), flush=True)
+                    progress.update(len(chunk))
     partial.replace(output)
     if not archive_looks_readable(output):
         quarantine_download(output, "downloaded file is not a valid archive")
         raise RuntimeError(f"Downloaded file is not a valid archive: {output}")
-    print(f"Saved: {output}")
+    get_logger(__name__).info("Saved firmware archive: %s", output)
     return output
 
 
 def download_json(url, output):
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading: {url}")
+    get_logger(__name__).info("Downloading JSON: %s", url)
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     data = r.json()
     with open(output, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
-    print(f"Saved: {output}")
+    get_logger(__name__).info("Saved JSON: %s", output)
     return output
 
 
@@ -247,24 +224,19 @@ def extract_archive(archive, output_dir):
     if suffixes.endswith(".zip"):
         with zipfile.ZipFile(archive) as zf:
             members = zf.infolist()
-            total = len(members)
-            print(f"Extracting: {archive} -> {output_dir}")
-            for index, member in enumerate(members, 1):
+            get_logger(__name__).info(
+                "Extracting archive: %s -> %s", archive, output_dir
+            )
+            for member in tqdm(members, desc=f"Extract {archive.name}", unit="file"):
                 zf.extract(member, output_dir)
-                if index == total or index % 25 == 0:
-                    percent = index * 100 / total if total else 100
-                    filled = int(percent // 5)
-                    bar = "#" * filled + "." * (20 - filled)
-                    print(
-                        f"Extracting: [{bar}] {percent:5.1f}% {index}/{total}",
-                        flush=True,
-                    )
         return output_dir
 
     seven_zip = shutil.which("7z")
     if seven_zip:
-        subprocess.run(
-            [seven_zip, "x", str(archive), f"-o{output_dir}", "-y"], check=True
+        run_process(
+            [seven_zip, "x", str(archive), f"-o{output_dir}", "-y"],
+            label="7z extract",
+            logger=get_logger(__name__),
         )
         return output_dir
 

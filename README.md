@@ -40,4 +40,14 @@ Python import:
 import lrsa
 ```
 
-The package source lives under `src/lrsa`.
+## Source Layout
+
+The package source lives under `src/lrsa`:
+
+- `api/`: LRSA API client, endpoints, resource parsing, and downloads
+- `auth/`: Lenovo ID, Passport, token capture, and login helpers
+- `core/`: shared primitives such as crypto
+- `device/`: USB and fastboot preflight checks
+- `flash/`: Software Fix flow, QFIL integration, boot-chain checks, and ROM decrypt helpers
+- `diagnostics/`: static analysis and unlock research utilities
+- `servers/`: local capture and relay server entrypoints

@@ -5,11 +5,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-QUALCOMM_EDL_IDS = {
-    (0x05C6, 0x9008),
-    (0x05C6, 0x900E),
-    (0x05C6, 0x9006),
-}
+from lrsa.logging import get_logger
+from lrsa.process import command_text, format_process_output
+
+from .constants import QUALCOMM_EDL_IDS
 
 
 def find_qualcomm_edl_devices() -> list[dict[str, str]]:
@@ -44,8 +43,10 @@ def require_qualcomm_edl_device() -> list[dict[str, str]]:
 def run_fastboot_getvar_all(
     fastboot: str | Path = "fastboot", timeout: int = 20
 ) -> dict[str, str]:
+    command = [str(fastboot), "getvar", "all"]
+    get_logger(__name__).info("Running fastboot preflight: %s", command_text(command))
     proc = subprocess.run(
-        [str(fastboot), "getvar", "all"],
+        command,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -61,9 +62,23 @@ def run_fastboot_getvar_all(
             continue
         key, value = line.split(":", 1)
         props[key.strip().lower()] = value.strip()
-    if proc.returncode != 0 and not props:
-        raise RuntimeError(
-            f"fastboot getvar all failed: {text.strip() or proc.returncode}"
+    if proc.returncode != 0:
+        detail = format_process_output(proc.stdout, proc.stderr)
+        if props:
+            get_logger(__name__).warning(
+                "fastboot getvar all returned exit code %s but %s properties were parsed.\n%s",
+                proc.returncode,
+                len(props),
+                detail,
+            )
+        else:
+            raise RuntimeError(
+                f"fastboot getvar all failed with exit code {proc.returncode}: "
+                f"{command_text(command)}\n{detail}"
+            )
+    else:
+        get_logger(__name__).debug(
+            "fastboot getvar all parsed %s properties", len(props)
         )
     return props
 

@@ -6,14 +6,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .device_preflight import run_fastboot_getvar_all
-
-FASTBOOT_CHECK_STEPS = {
-    "FastbootDeviceMatchCheck",
-    "FastbootMatchFlashFile",
-    "ReadPropertiesInFastboot",
-    "BatFileVersionCheck",
-}
+from .constants import FASTBOOT_CHECK_STEPS
+from .preflight import run_fastboot_getvar_all
 
 
 def flow_step_names(flow: dict[str, Any]) -> list[str]:

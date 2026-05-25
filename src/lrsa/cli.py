@@ -1,19 +1,32 @@
-"""Command line entrypoint for the standalone LRSA workflow."""
+"""Command line entrypoint for the reusable LRSA workflow."""
+
+from lrsa.logging import get_logger
 
 import argparse
-import subprocess
-import sys
 from pathlib import Path
 
 from requests.exceptions import RequestException
 
 from .auth import extract_token_from_file, save_json
-from .boot_chain import (
+from .api.client import LRSAClient
+from .api.firmware import (
+    pick_firmware_url,
+    response_payload,
+)
+from .api.resources import (
+    api_payload,
+    content_list,
+    is_success_payload,
+    resource_at,
+    resource_summary,
+)
+from .device.flow_checks import validate_fastboot_recipe_checks
+from .device.preflight import format_usb_devices, require_qualcomm_edl_device
+from .flash.boot_chain import (
     DEFAULT_BOOT_CHAIN_LABELS,
     format_verify_result,
     verify_boot_chain,
 )
-from .client import LRSAClient
 from .config import (
     DEFAULT_EDL,
     DEFAULT_MODEL,
@@ -21,14 +34,11 @@ from .config import (
     DEFAULT_STOCK_DIR,
     DEFAULT_WORK_DIR,
 )
-from .device_preflight import format_usb_devices, require_qualcomm_edl_device
-from .firmware import (
-    pick_firmware_url,
-    response_payload,
+from .auth.login import (
+    guest_login as run_guest_login,
+    lenovoid_login as run_lenovoid_login,
 )
-from .flow_checks import validate_fastboot_recipe_checks
-from .login import guest_login as run_guest_login, lenovoid_login as run_lenovoid_login
-from .qfil import format_command, resolve_qfil_image_dir
+from .flash.qfil import resolve_qfil_image_dir
 from qfil import (
     build_qfil_module_command,
     parse_program_entries,
@@ -36,19 +46,10 @@ from qfil import (
     run_qfil_plan,
     summarize_plan,
 )
-from .resources import (
-    api_payload,
-    content_list,
-    is_success_payload,
-    resource_at,
-    resource_summary,
-)
-from .software_fix_flow import (
-    DEFAULT_WHISKY_BOTTLE,
+from .flash.software_fix_flow import (
     is_mobile_or_tablet,
     load_flow,
     prepare_artifacts,
-    whisky_command,
 )
 
 
@@ -62,7 +63,7 @@ def resource_match_preflight(
     platform = resource.get("platform") or "(unknown platform)"
     category = resource.get("category") or "(unknown category)"
     status = "PASS" if rom_match_id.lower().startswith("success") else "CHECK"
-    print(
+    get_logger(__name__).info(
         f"Resource preflight [{status}]: {lookup_kind}={lookup_value} -> "
         f"{model} / {platform} / {category} / romMatchId={rom_match_id or '(none)'}"
     )
@@ -117,20 +118,8 @@ def main():
         help="Use Lenovo Software Fix artifacts and the native qfil module.",
     )
     parser.add_argument(
-        "--no-tool-download",
-        action="store_true",
-        help="Skip downloading/extracting the Software Fix flash tool package.",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["native", "whisky"],
-        default="native",
-        help="native uses the local qfil module for Rescue.cmd flows; whisky runs Lenovo's Windows tools.",
-    )
-    parser.add_argument("--whisky-bottle", default=DEFAULT_WHISKY_BOTTLE)
-    parser.add_argument(
         "--com-port",
-        help="Detected Qualcomm port for Software Fix startup files, e.g. COM3 or 3.",
+        help="Accepted for compatibility. Native qfil auto-detects the EDL USB transport.",
     )
     parser.add_argument(
         "--skip-api",
@@ -196,12 +185,14 @@ def main():
             raise RuntimeError(f"edl.py not found: {args.edl}")
         if not args.skip_edl_preflight:
             devices = require_qualcomm_edl_device()
-            print(f"EDL preflight passed: {format_usb_devices(devices)}")
+            get_logger(__name__).info(
+                f"EDL preflight passed: {format_usb_devices(devices)}"
+            )
         labels = tuple(
             part.strip() for part in args.boot_chain_labels.split(",") if part.strip()
         )
-        print(f"Verifying boot-chain readback against: {image_dir}")
-        print(f"Labels: {', '.join(labels)}")
+        get_logger(__name__).info(f"Verifying boot-chain readback against: {image_dir}")
+        get_logger(__name__).info(f"Labels: {', '.join(labels)}")
         results = verify_boot_chain(
             image_dir,
             args.work_dir,
@@ -213,9 +204,9 @@ def main():
         output_path = args.work_dir / "boot_chain_verify.json"
         save_json(output_path, {"imageDir": str(image_dir), "results": results})
         for result in results:
-            print(format_verify_result(result))
+            get_logger(__name__).info(format_verify_result(result))
         failed = [result for result in results if result.get("status") == "FAIL"]
-        print(f"Boot-chain verification saved: {output_path}")
+        get_logger(__name__).info(f"Boot-chain verification saved: {output_path}")
         if failed:
             raise RuntimeError(
                 f"{len(failed)} boot-chain partition(s) failed verification."
@@ -250,32 +241,38 @@ def main():
         else:
             session = {"method": "none", "token": token}
         save_json(args.work_dir / "login_session.json", session)
-        print(f"Saved login session: {args.work_dir / 'login_session.json'}")
+        get_logger(__name__).info(
+            f"Saved login session: {args.work_dir / 'login_session.json'}"
+        )
         return
 
     if args.login == "guest" and not token and not args.skip_api:
-        print("Bootstrapping guest session...")
+        get_logger(__name__).info("Bootstrapping guest session...")
         for name, result in client.bootstrap_guest_session():
-            print(f"{name}: HTTP {result['status']}")
+            get_logger(__name__).info(f"{name}: HTTP {result['status']}")
         if client.token:
-            print("Guest token captured.")
+            get_logger(__name__).info("Guest token captured.")
 
     firmware_url = None
     resource = None
     if not args.skip_api:
         if args.imei:
-            print(f"\nQuerying rescue ROM by IMEI: {args.imei}")
+            get_logger(__name__).info(f"\nQuerying rescue ROM by IMEI: {args.imei}")
             result = client.get_resources_by_imei(args.imei, args.imei2)
         else:
             if not args.model or not args.sn:
                 parser.error(
                     "SN lookup requires --model and --sn, or use --imei for phone/mobile lookup."
                 )
-            print(f"\nQuerying rescue ROM by SN: model={args.model}, sn={args.sn}")
+            get_logger(__name__).info(
+                f"\nQuerying rescue ROM by SN: model={args.model}, sn={args.sn}"
+            )
             result = client.get_rescue_rom(args.model, args.sn)
         payload = response_payload(result)
         save_json(args.work_dir / "rescue_rom_response.json", payload)
-        print(f"Rescue response saved: {args.work_dir / 'rescue_rom_response.json'}")
+        get_logger(__name__).info(
+            f"Rescue response saved: {args.work_dir / 'rescue_rom_response.json'}"
+        )
 
         api = api_payload(result)
         if not is_success_payload(api):
@@ -293,10 +290,10 @@ def main():
                 "use IMEI for phones/mobile, or correct Model + SN for tablet/laptop lookup."
             )
         if len(resources) > 1:
-            print("\nAvailable firmware resources:")
+            get_logger(__name__).info("\nAvailable firmware resources:")
             for index, candidate in enumerate(resources):
                 summary = resource_summary(candidate)
-                print(
+                get_logger(__name__).info(
                     f"  [{index}] {summary.get('firmwareName') or '(unnamed firmware)'} "
                     f"- {summary.get('modelName') or '(unknown model)'} "
                     f"romMatchId={summary.get('romMatchId') or '(none)'}"
@@ -305,11 +302,11 @@ def main():
         resource = resource_at(api, args.firmware_index)
         summary = resource_summary(resource)
         if summary:
-            print(
+            get_logger(__name__).info(
                 f"Matched resource: {summary.get('modelName')} ({summary.get('category')})"
             )
             if summary.get("firmwareName"):
-                print(f"Firmware: {summary['firmwareName']}")
+                get_logger(__name__).info(f"Firmware: {summary['firmwareName']}")
         if resource:
             resource_match_preflight(
                 resource,
@@ -320,11 +317,11 @@ def main():
 
         firmware_url = pick_firmware_url(payload, resource_index=args.firmware_index)
         if firmware_url:
-            print(f"Firmware URL candidate: {firmware_url}")
+            get_logger(__name__).info(f"Firmware URL candidate: {firmware_url}")
         else:
-            print("No firmware URL found in response.")
+            get_logger(__name__).info("No firmware URL found in response.")
     else:
-        print("Skipping LRSA API calls.")
+        get_logger(__name__).info("Skipping LRSA API calls.")
 
     if args.flow == "software-fix":
         if not resource:
@@ -336,214 +333,161 @@ def main():
                 f"Software Fix mobile/tablet flow does not support category: {resource.get('category')}"
             )
 
-        print("\nPreparing Software Fix artifacts...")
+        get_logger(__name__).info("\nPreparing Software Fix artifacts...")
         manifest = prepare_artifacts(
             resource,
             args.work_dir,
             download_rom=args.download,
             extract_rom=args.extract,
-            download_tool=(args.backend == "whisky" and not args.no_tool_download),
-            extract_tool=(args.backend == "whisky" and not args.no_tool_download),
-            com_port=args.com_port,
         )
         manifest_path = args.work_dir / "software_fix" / "manifest.json"
         save_json(manifest_path, manifest)
-        print(f"Software Fix manifest saved: {manifest_path}")
+        get_logger(__name__).info(f"Software Fix manifest saved: {manifest_path}")
 
         if manifest.get("flashFlowSummary"):
-            print("\nSoftware Fix flash flow:")
+            get_logger(__name__).info("\nSoftware Fix flash flow:")
             for line in manifest["flashFlowSummary"]:
-                print(f"  {line}")
+                get_logger(__name__).info(f"  {line}")
 
-        if manifest.get("toolDir"):
-            print(f"\nTool package ready: {manifest['toolDir']}")
-        if manifest.get("toolMd5"):
-            status = manifest["toolMd5"]
-            if status.get("skipped"):
-                print("Tool MD5 check skipped: Lenovo did not provide an MD5.")
-            else:
-                print(f"Tool MD5 verified: {status['actual']}")
         if manifest.get("romArchive"):
-            print(f"ROM archive ready: {manifest['romArchive']}")
+            get_logger(__name__).info(f"ROM archive ready: {manifest['romArchive']}")
         if manifest.get("romMd5"):
             status = manifest["romMd5"]
             if status.get("skipped"):
-                print("ROM MD5 check skipped: Lenovo did not provide an MD5.")
+                get_logger(__name__).info(
+                    "ROM MD5 check skipped: Lenovo did not provide an MD5."
+                )
             else:
-                print(f"ROM MD5 verified: {status['actual']}")
+                get_logger(__name__).info(f"ROM MD5 verified: {status['actual']}")
         if manifest.get("decryptedFiles"):
-            print(
+            get_logger(__name__).info(
                 f"Decrypted Software Fix ROM helper files: {len(manifest['decryptedFiles'])}"
             )
         if not manifest.get("romArchive") and manifest.get("romUrl"):
-            print("ROM archive not downloaded. Add --download to fetch it.")
+            get_logger(__name__).info(
+                "ROM archive not downloaded. Add --download to fetch it."
+            )
         if manifest.get("expectedStartupFiles"):
-            print(
+            get_logger(__name__).info(
                 "Startup file not found. Add --download --extract so the ROM package can provide "
                 + "/".join(manifest["expectedStartupFiles"])
                 + "."
             )
-        if manifest.get("startupCommands"):
-            print("\nSoftware Fix startup command plan:")
-            for item in manifest["startupCommands"]:
-                exe = item.get("executable") or f"missing:{item.get('exePattern')}"
-                print(f"  {Path(exe).name}: {item.get('arguments', '')}")
-        if manifest.get("missingStartupTools"):
-            print(
-                f"Missing startup tools: {', '.join(manifest['missingStartupTools'])}"
+        if (
+            args.flash
+            and not args.allow_stock_flash
+            and not manifest.get("romDir")
+            and not args.image_dir
+        ):
+            raise RuntimeError(
+                "Refusing native --flash from stock fallback. Use --download --extract for the matched Lenovo ROM, "
+                "or pass --image-dir for a verified extracted ROM, or --allow-stock-flash explicitly."
             )
-
-        if args.backend == "native":
-            if (
-                args.flash
-                and not args.allow_stock_flash
-                and not manifest.get("romDir")
-                and not args.image_dir
-            ):
-                raise RuntimeError(
-                    "Refusing native --flash from stock fallback. Use --download --extract for the matched Lenovo ROM, "
-                    "or pass --image-dir for a verified extracted ROM, or --allow-stock-flash explicitly."
-                )
-            native_base_dir = Path(
-                manifest.get("romDir") or args.image_dir or args.stock_dir
-            ).resolve()
-            if not native_base_dir.exists():
-                raise RuntimeError(
-                    f"Native backend image directory does not exist: {native_base_dir}"
-                )
-            native_image_dir = resolve_qfil_image_dir(
-                native_base_dir, manifest.get("startupFile")
+        native_base_dir = Path(
+            manifest.get("romDir") or args.image_dir or args.stock_dir
+        ).resolve()
+        if not native_base_dir.exists():
+            raise RuntimeError(
+                f"Native qfil image directory does not exist: {native_base_dir}"
             )
-            if not native_image_dir.exists():
-                raise RuntimeError(
-                    f"Native backend image directory does not exist: {native_image_dir}"
+        native_image_dir = resolve_qfil_image_dir(
+            native_base_dir, manifest.get("startupFile")
+        )
+        if not native_image_dir.exists():
+            raise RuntimeError(
+                f"Native qfil image directory does not exist: {native_image_dir}"
+            )
+        if manifest.get("flashFlowPath"):
+            flow = load_flow(Path(manifest["flashFlowPath"]))
+            fastboot_result = validate_fastboot_recipe_checks(
+                flow,
+                resource,
+                image_dir=native_image_dir,
+                fastboot=args.fastboot,
+                require=args.flash,
+            )
+            if fastboot_result["requiredSteps"]:
+                get_logger(__name__).info(
+                    f"Fastboot recipe checks: {', '.join(fastboot_result['requiredSteps'])}"
                 )
-            if manifest.get("flashFlowPath"):
-                flow = load_flow(Path(manifest["flashFlowPath"]))
-                fastboot_result = validate_fastboot_recipe_checks(
-                    flow,
-                    resource,
-                    image_dir=native_image_dir,
-                    fastboot=args.fastboot,
-                    require=args.flash,
-                )
-                if fastboot_result["requiredSteps"]:
-                    print(
-                        f"Fastboot recipe checks: {', '.join(fastboot_result['requiredSteps'])}"
+                if fastboot_result["checked"]:
+                    get_logger(__name__).info("Fastboot property preflight passed.")
+                elif fastboot_result.get("warning"):
+                    get_logger(__name__).warning(
+                        "Fastboot property preflight warning: %s",
+                        fastboot_result["warning"],
                     )
-                    if fastboot_result["checked"]:
-                        print("Fastboot property preflight passed.")
-                    elif fastboot_result.get("warning"):
-                        print(
-                            f"Fastboot property preflight warning: {fastboot_result['warning']}"
-                        )
-                else:
-                    print("Fastboot recipe checks: none required by this flow.")
-            if args.all_xml:
-                raise RuntimeError(
-                    "--all-xml is no longer supported for flashing; native QFIL follows Rescue.cmd exactly."
-                )
-            if not manifest.get("startupFile"):
-                raise RuntimeError(
-                    "Native QFIL requires the official Software Fix StartupFile. "
-                    "Run with --download --extract so the ROM package provides Rescue.cmd/Flash.cmd."
-                )
-            qfil_plan = parse_rescue_cmd(
-                Path(manifest["startupFile"]), native_image_dir
-            )
-            if (
-                args.loader
-                and qfil_plan.programmer
-                and Path(args.loader).resolve() != qfil_plan.programmer.loader
-            ):
-                raise RuntimeError(
-                    "Refusing loader override because Rescue.cmd provides the official programmer: "
-                    f"{qfil_plan.programmer.loader}"
-                )
-            print("\nSoftware Fix QFIL compatibility plan:")
-            for line in summarize_plan(qfil_plan):
-                print(f"  {line}")
-            rawprograms = list(qfil_plan.firehose.rawprograms)
-            patches = list(qfil_plan.firehose.patches)
-            command = build_qfil_module_command(qfil_plan)
-            missing_xml = [
-                str(path)
-                for path in [*rawprograms, *patches]
-                if not Path(path).exists()
-            ]
-            if missing_xml:
-                raise RuntimeError(
-                    f"Native QFIL XML preflight failed under {native_image_dir}: missing {', '.join(missing_xml)}"
-                )
-            print("\nNative Python Sahara/Firehose plan:")
-            print(f"Rawprogram XMLs: {', '.join(p.name for p in rawprograms)}")
-            print(
-                f"Patch XMLs: {', '.join(p.name for p in patches) if patches else '(none)'}"
-            )
-            program_entries = parse_program_entries(rawprograms)
-            if program_entries:
-                print(f"Program entries: {len(program_entries)}")
-                print("Program order:")
-                for entry in program_entries[:24]:
-                    sectors = entry.sectors if entry.sectors is not None else "dynamic"
-                    print(
-                        f"  {entry.xml.name}: {entry.filename} -> {entry.label} "
-                        f"lun={entry.lun} sector={entry.start_sector} sectors={sectors}"
-                    )
-                if len(program_entries) > 24:
-                    print(f"  ... {len(program_entries) - 24} more entries")
-            print(" ".join(command))
-            if args.flash:
-                if not args.skip_edl_preflight:
-                    devices = require_qualcomm_edl_device()
-                    print(f"EDL preflight passed: {format_usb_devices(devices)}")
-                print(
-                    "\nExecuting native flash. Device must already be in Qualcomm 9008 EDL mode."
-                )
-                run_qfil_plan(qfil_plan, dry_run=False)
             else:
-                print("\nDry run only. Add --flash to execute native flashing.")
-            return
-
-        startup = manifest.get("startupFile")
+                get_logger(__name__).info(
+                    "Fastboot recipe checks: none required by this flow."
+                )
+        if args.all_xml:
+            raise RuntimeError(
+                "--all-xml is no longer supported for flashing; native qfil follows Rescue.cmd exactly."
+            )
+        if not manifest.get("startupFile"):
+            raise RuntimeError(
+                "Native qfil requires the official Software Fix StartupFile. "
+                "Run with --download --extract so the ROM package provides Rescue.cmd/Flash.cmd."
+            )
+        qfil_plan = parse_rescue_cmd(Path(manifest["startupFile"]), native_image_dir)
+        if (
+            args.loader
+            and qfil_plan.programmer
+            and Path(args.loader).resolve() != qfil_plan.programmer.loader
+        ):
+            raise RuntimeError(
+                "Refusing loader override because Rescue.cmd provides the official programmer: "
+                f"{qfil_plan.programmer.loader}"
+            )
+        get_logger(__name__).info("\nSoftware Fix qfil compatibility plan:")
+        for line in summarize_plan(qfil_plan):
+            get_logger(__name__).info(f"  {line}")
+        rawprograms = list(qfil_plan.firehose.rawprograms)
+        patches = list(qfil_plan.firehose.patches)
+        command = build_qfil_module_command(qfil_plan)
+        missing_xml = [
+            str(path) for path in [*rawprograms, *patches] if not Path(path).exists()
+        ]
+        if missing_xml:
+            raise RuntimeError(
+                f"Native qfil XML preflight failed under {native_image_dir}: missing {', '.join(missing_xml)}"
+            )
+        get_logger(__name__).info("\nNative Python Sahara/Firehose plan:")
+        get_logger(__name__).info(
+            f"Rawprogram XMLs: {', '.join(p.name for p in rawprograms)}"
+        )
+        get_logger(__name__).info(
+            f"Patch XMLs: {', '.join(p.name for p in patches) if patches else '(none)'}"
+        )
+        program_entries = parse_program_entries(rawprograms)
+        if program_entries:
+            get_logger(__name__).info(f"Program entries: {len(program_entries)}")
+            get_logger(__name__).info("Program order:")
+            for entry in program_entries[:24]:
+                sectors = entry.sectors if entry.sectors is not None else "dynamic"
+                get_logger(__name__).info(
+                    f"  {entry.xml.name}: {entry.filename} -> {entry.label} "
+                    f"lun={entry.lun} sector={entry.start_sector} sectors={sectors}"
+                )
+            if len(program_entries) > 24:
+                get_logger(__name__).info(
+                    f"  ... {len(program_entries) - 24} more entries"
+                )
+        get_logger(__name__).info(" ".join(command))
         if args.flash:
-            startup_commands = manifest.get("startupCommands") or []
-            if startup and startup_commands:
-                if manifest.get("startupRequiresComPort") and not args.com_port:
-                    raise RuntimeError(
-                        "Startup file needs a COM port. Re-run with --com-port COMx."
-                    )
-                if manifest.get("missingStartupTools"):
-                    raise RuntimeError(
-                        "Startup file references tools that were not found: "
-                        + ", ".join(manifest["missingStartupTools"])
-                    )
-
-                print("\nExecuting Software Fix command plan:")
-                for item in startup_commands:
-                    executable = Path(item["executable"])
-                    command = whisky_command(
-                        executable, args.whisky_bottle, *item.get("argv", [])
-                    )
-                    print(format_command(command, cwd=executable.parent))
-                    subprocess.run(command, cwd=executable.parent, check=True)
-            else:
-                raise RuntimeError(
-                    "Software Fix flow did not produce the StartupFile yet. "
-                    "Download and extract the ROM package; Software Fix expects Rescue.cmd/Flash.cmd there."
+            if not args.skip_edl_preflight:
+                devices = require_qualcomm_edl_device()
+                get_logger(__name__).info(
+                    f"EDL preflight passed: {format_usb_devices(devices)}"
                 )
-        elif manifest.get("qfilExe"):
-            command = whisky_command(
-                Path(manifest["qfilExe"]), args.whisky_bottle, "--command"
+            get_logger(__name__).info(
+                "\nExecuting native flash. Device must already be in Qualcomm 9008 EDL mode."
             )
-            print("\nQFIL launch command through Whisky:")
-            print(format_command(command, cwd=Path(manifest["qfilExe"]).parent))
-            print(
-                "\nDry run only. Add --download --extract, then --flash after the startup file is present."
-            )
+            run_qfil_plan(qfil_plan, dry_run=False)
         else:
-            print(
-                "\nWhisky backend selected, but QFIL.exe was not prepared. Remove --no-tool-download."
+            get_logger(__name__).info(
+                "\nDry run only. Add --flash to execute native flashing."
             )
         return
 
@@ -559,7 +503,6 @@ if __name__ == "__main__":
         RuntimeError,
         IndexError,
         RequestException,
-        subprocess.SubprocessError,
     ) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        get_logger(__name__).error("Error: %s", exc)
         raise SystemExit(1)

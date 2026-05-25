@@ -8,46 +8,29 @@ Python qfil module for the 1v1 port effort.
 
 from __future__ import annotations
 
+from lrsa.logging import get_logger
+
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 import dnfile
 import pefile
 
-
-DEFAULT_ROOT = Path("lrsa_work/software_fix")
-DEFAULT_OUTPUT = Path("lrsa_work/qfil_audit")
-
-CODE_SUFFIXES = {
-    ".exe",
-    ".dll",
-    ".ocx",
-    ".tlb",
-    ".resources",
-    ".cmd",
-    ".cnt",
-    ".hlp",
-    ".htm",
-    ".html",
-    ".json",
-    ".xml",
-    ".il",
-    ".txt",
-}
-FIRMWARE_SUFFIXES = {".img", ".bin", ".elf", ".mbn", ".melf", ".hex", ".fv", ".x", ".t"}
-HASH_LIMIT_BYTES = 128 * 1024 * 1024
-STRING_SCAN_LIMIT_BYTES = 64 * 1024 * 1024
-
-URL_RE = re.compile(rb"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
-PATH_RE = re.compile(rb"(?:[A-Za-z]:\\|\\\\\.\\|/)[A-Za-z0-9_.$%~+@(){}\\/\- ]{4,}")
-ENV_RE = re.compile(rb"%[A-Za-z_][A-Za-z0-9_]*%|\$[A-Za-z_][A-Za-z0-9_]*")
-PROTO_RE = re.compile(
-    rb"\b(?:sahara|firehose|fh_loader|qsahara|qdloader|qfil|ufs|emmc|xml|rawprogram|patch|setbootablestoragedrive|configure|program|erase|read|power|reset|noprompt|zlpawarehost|memoryname)\b",
-    re.IGNORECASE,
+from .constants import (
+    CODE_SUFFIXES,
+    DEFAULT_QFIL_AUDIT_OUTPUT,
+    DEFAULT_QFIL_AUDIT_ROOT,
+    ENV_RE,
+    FIRMWARE_SUFFIXES,
+    HASH_LIMIT_BYTES,
+    PATH_RE,
+    PROTO_RE,
+    STRING_SCAN_LIMIT_BYTES,
+    URL_RE,
 )
 
 
@@ -508,8 +491,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Audit local Lenovo/QFIL files against the Python qfil port."
     )
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--root", type=Path, default=DEFAULT_QFIL_AUDIT_ROOT)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_QFIL_AUDIT_OUTPUT)
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
@@ -532,10 +515,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     write_markdown(root, out_dir, items, summary, gaps)
 
-    print(f"Analyzed {len(items)} files under {root}")
-    print(f"Wrote {out_dir / 'INVENTORY.md'}")
-    print(f"Wrote {out_dir / 'NATIVE_QFIL_AUDIT.md'}")
-    print(f"Wrote {out_dir / 'NATIVE_QFIL_TODO.md'}")
+    get_logger(__name__).info(f"Analyzed {len(items)} files under {root}")
+    get_logger(__name__).info(f"Wrote {out_dir / 'INVENTORY.md'}")
+    get_logger(__name__).info(f"Wrote {out_dir / 'NATIVE_QFIL_AUDIT.md'}")
+    get_logger(__name__).info(f"Wrote {out_dir / 'NATIVE_QFIL_TODO.md'}")
     return 0
 
 

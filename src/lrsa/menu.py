@@ -2,26 +2,32 @@
 
 from __future__ import annotations
 
-import shlex
 import json
 import shutil
 import subprocess
 import sys
-import threading
-import os
-import re
 import textwrap
-import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from lrsa.logging import get_logger
+from lrsa.process import command_text
+
+from .api.client import LRSAClient
+from .api.firmware import response_payload
+from .api.resources import content_list, is_success_payload, resource_summary
 from .auth import extract_token_from_file, save_json
-from .client import LRSAClient
 from .config import DEFAULT_EDL, DEFAULT_MODEL, DEFAULT_SN, DEFAULT_WORK_DIR
-from .device_preflight import find_qualcomm_edl_devices, format_usb_devices
-from .firmware import response_payload
-from .resources import content_list, is_success_payload, resource_summary
+from .device.preflight import find_qualcomm_edl_devices, format_usb_devices
+from .menu_constants import (
+    BORDER,
+    MIN_UI_WIDTH,
+    PATH_FIELDS,
+    STATE_FILE,
+    STATE_VERSION,
+    UI_WIDTH,
+)
 
 try:
     from prompt_toolkit.application import Application
@@ -71,22 +77,8 @@ class SettingItem:
     setter: Callable[[MenuState, str], None]
 
 
-STATE_FILE = DEFAULT_WORK_DIR / "menu_state.json"
-STATE_VERSION = 1
-PATH_FIELDS = {"token_file", "work_dir", "edl"}
-UI_WIDTH = 88
-MIN_UI_WIDTH = 56
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\^\[\[[0-9;?]*[ -/]*[@-~]")
-LOGGER_NAME_LINES = {"firehose", "firehose_client", "sahara", "main"}
-BORDER = {
-    "top": ("╭", "╮"),
-    "mid": ("├", "┤"),
-    "bottom": ("╰", "╯"),
-}
-
-
 def quote_command(command: list[str]) -> str:
-    return " ".join(shlex.quote(str(part)) for part in command)
+    return command_text(command)
 
 
 def path_or_auto(value: str) -> str:
@@ -103,41 +95,6 @@ def fit_text(value: str, width: int) -> str:
     if width <= 1:
         return value[:width]
     return value[: width - 1] + "."
-
-
-def compact_url(value: str) -> str:
-    parsed = urllib.parse.urlparse(value.strip())
-    if parsed.scheme and parsed.netloc:
-        name = Path(urllib.parse.unquote(parsed.path)).name
-        return f"{parsed.netloc}/{name}" if name else parsed.netloc
-    return value
-
-
-def compact_command(command: list[str]) -> str:
-    if "-m" in command:
-        index = command.index("-m")
-        module = command[index + 1] if index + 1 < len(command) else command[0]
-        flags = [part for part in command[index + 2 :] if str(part).startswith("--")]
-        return " ".join([module, *flags[:4]])
-    return Path(str(command[0])).name if command else "(command)"
-
-
-def clean_output_text(value: str) -> str:
-    return ANSI_RE.sub("", str(value)).replace("\r", "\n")
-
-
-def command_work_dir(command: list[str]) -> Path:
-    for index, part in enumerate(command):
-        if part == "--work-dir" and index + 1 < len(command):
-            return Path(command[index + 1])
-    for index, part in enumerate(command):
-        if part == "--out-dir" and index + 1 < len(command):
-            return Path(command[index + 1]).parent
-    return DEFAULT_WORK_DIR
-
-
-def command_log_path(command: list[str]) -> Path:
-    return command_work_dir(command) / "last_job.log"
 
 
 def ui_width() -> int:
@@ -171,21 +128,6 @@ def wrap_for_box(text: str, *, width: int, subsequent_indent: str = "  ") -> lis
         break_long_words=True,
         break_on_hyphens=False,
     ) or [""]
-
-
-def spaced_wrapped_rows(lines: list[str], *, width: int, max_rows: int) -> list[str]:
-    rows = wrapped_rows(lines, width=width)
-    return rows[-max_rows:]
-
-
-def wrapped_rows(lines: list[str], *, width: int) -> list[str]:
-    rows: list[str] = []
-    for line in lines:
-        rows.extend(wrap_for_box(line, width=width))
-        rows.append("")
-    if rows and rows[-1] == "":
-        rows.pop()
-    return rows
 
 
 def styled_box_line(text: str, *, width: int, margin: str, style: str):
@@ -320,7 +262,7 @@ def login_command(state: MenuState) -> list[str]:
         sys.executable,
         "-u",
         "-m",
-        "lrsa.capture_server",
+        "lrsa.servers.capture",
         "--out-dir",
         str(state.token_file.parent),
     ]
@@ -347,14 +289,6 @@ def flash_command(state: MenuState) -> list[str]:
 def verify_boot_chain_command(state: MenuState) -> list[str]:
     command = cli_base(state)
     command.extend(["--login", "none", "--verify-boot-chain"])
-    return command
-
-
-def whisky_command(state: MenuState) -> list[str]:
-    command = cli_base(state)
-    command.extend(
-        ["--login", "none", "--backend", "whisky", "--download", "--extract"]
-    )
     return command
 
 
@@ -529,7 +463,7 @@ def choose_item(
 
 def show_message(title: str, text: str) -> None:
     if message_dialog is None:
-        print(f"\n{title}\n{text}\n")
+        get_logger(__name__).info(f"\n{title}\n{text}\n")
         return
     message_dialog(title=title, text=text, ok_text="Back", style=ui_style()).run()
 
@@ -724,402 +658,23 @@ def run_command(
     if flash:
         if not confirm_flash(command):
             return 0
-    if Application is not None and sys.stdin.isatty() and sys.stdout.isatty():
-        return run_command_view(command, stdin_text=stdin_text)
 
-    print("\nRunning:")
-    print(quote_command(command))
-    print()
+    get_logger(__name__).info("\nRunning:")
+    get_logger(__name__).info(quote_command(command))
+    get_logger(__name__).info("")
     result = subprocess.run(
         command, input=stdin_text, text=stdin_text is not None
     ).returncode
-    input("\nPress Enter to return to LRSA menu...")
+    if result != 0:
+        get_logger(__name__).error("Command failed with exit code %s", result)
+        if sys.stdin.isatty():
+            show_message(
+                "Command Failed",
+                f"Exit code: {result}\n\nCommand:\n{quote_command(command)}",
+            )
+    if sys.stdin.isatty():
+        input("\nPress Enter to return to LRSA menu...")
     return result
-
-
-def run_command_view(command: list[str], *, stdin_text: str | None = None) -> int:
-    width = ui_width()
-    max_log_rows = max(8, shutil.get_terminal_size((100, 30)).lines - 18)
-    log_lines: list[str] = [f"Command: {compact_command(command)}", ""]
-    log_path = command_log_path(command)
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(f"$ {quote_command(command)}\n\n", encoding="utf-8")
-    except OSError:
-        pass
-    status = {"text": "Running", "returncode": None}
-    progress = {
-        "active": False,
-        "label": "",
-        "bar": "",
-        "percent": "",
-        "detail": "",
-        "phase": "",
-    }
-    scroll = {"offset": 0}
-    process_holder: dict[str, subprocess.Popen | None] = {"process": None}
-
-    def write_log(part: str) -> None:
-        try:
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(part + "\n")
-        except OSError:
-            pass
-
-    def append_line(line: str) -> None:
-        cleaned = clean_output_text(line)
-        for part in cleaned.rstrip("\n").splitlines() or [""]:
-            write_log(part)
-            if part.strip() in LOGGER_NAME_LINES:
-                continue
-            if update_progress(part):
-                continue
-            if not part.strip():
-                continue
-            log_lines.append(part)
-        del log_lines[:-600]
-        if scroll["offset"] == 0:
-            scroll["offset"] = 0
-
-    def update_progress(line: str) -> bool:
-        text = line.strip()
-        if text.startswith("Downloading: "):
-            progress["active"] = True
-            progress["label"] = compact_url(text.removeprefix("Downloading: "))
-            progress["bar"] = ""
-            progress["percent"] = ""
-            progress["detail"] = ""
-            progress["phase"] = "Download"
-            log_lines.append(f"Downloading: {progress['label']}")
-            return True
-        if text.startswith("Extracting: ") and " -> " in text:
-            progress["active"] = True
-            progress["label"] = text
-            progress["bar"] = ""
-            progress["percent"] = ""
-            progress["detail"] = ""
-            progress["phase"] = "Extract"
-            log_lines.append(text)
-            return True
-        match = re.match(
-            r"\[qfil\]\s+programming\s+(.+?)\s+->\s+(.+?)\s+lun=(\d+)\s+sector=([^\s.]+)",
-            text,
-        )
-        if match:
-            progress["active"] = True
-            progress["label"] = (
-                f"Writing {Path(match.group(1)).name} -> {match.group(2)}"
-            )
-            progress["bar"] = ""
-            progress["percent"] = ""
-            progress["detail"] = f"LUN {match.group(3)} sector {match.group(4)}"
-            progress["phase"] = "Flash"
-            log_lines.append(f"{progress['label']} ({progress['detail']})")
-            return True
-        match = re.match(
-            r"\[qfil\]\s+programming\s+(.+?)\s+to partition\((\d+)\)@sector\(([^)]+)\)",
-            text,
-        )
-        if match:
-            progress["active"] = True
-            progress["label"] = f"Writing {Path(match.group(1)).name}"
-            progress["bar"] = ""
-            progress["percent"] = ""
-            progress["detail"] = f"LUN {match.group(2)} sector {match.group(3)}"
-            progress["phase"] = "Flash"
-            log_lines.append(f"{progress['label']} ({progress['detail']})")
-            return True
-        if text.startswith("[qfil] patching"):
-            progress["active"] = True
-            progress["label"] = "Applying QFIL patch XMLs"
-            progress["bar"] = ""
-            progress["percent"] = ""
-            progress["detail"] = text
-            progress["phase"] = "Flash"
-            log_lines.append(text)
-            return True
-        match = re.match(r"Progress:\s+\[([#.]+)\]\s+([0-9.]+%)\s+(.+)", text)
-        if match:
-            progress["active"] = True
-            progress["bar"] = match.group(1)
-            progress["percent"] = match.group(2)
-            progress["detail"] = match.group(3)
-            return True
-        match = re.match(r"Extracting:\s+\[([#.]+)\]\s+([0-9.]+%)\s+(.+)", text)
-        if match:
-            progress["active"] = True
-            progress["bar"] = match.group(1)
-            progress["percent"] = match.group(2)
-            progress["detail"] = match.group(3)
-            return True
-        match = re.match(r"Progress:\s+\|([^\|]+)\|\s+([0-9.]+%)\s+(.+)", text)
-        if match:
-            progress["active"] = True
-            if progress["phase"] != "Flash":
-                progress["label"] = "Flashing device"
-                progress["phase"] = "Flash"
-            progress["bar"] = match.group(1).replace("-", ".")
-            progress["percent"] = match.group(2)
-            progress["detail"] = match.group(3)
-            return True
-        if text.startswith("Done |"):
-            return True
-        if text.startswith("Saved: "):
-            progress["detail"] = "Saved"
-            log_lines.append(text)
-            return True
-        return False
-
-    def fragments():
-        margin = ui_margin(width)
-        rows = wrapped_rows(log_lines, width=width)
-        max_offset = max(0, len(rows) - max_log_rows)
-        scroll["offset"] = min(scroll["offset"], max_offset)
-        if scroll["offset"]:
-            start = max(0, len(rows) - max_log_rows - scroll["offset"])
-            visible = rows[start : start + max_log_rows]
-        else:
-            visible = rows[-max_log_rows:]
-        progress_rows = 5 if progress["active"] else 0
-        content_rows = 8 + progress_rows + len(visible)
-        top_padding = max(
-            0, (shutil.get_terminal_size((100, 30)).lines - content_rows) // 2
-        )
-        result = [("class:screen", "\n" * top_padding)]
-        result.append(
-            ("class:border", box_rule(width=width, margin=margin, kind="top"))
-        )
-        result.append(
-            ("class:title", box_line(" LRSA Job ", width=width, margin=margin))
-        )
-        result.append(("class:border", box_rule(width=width, margin=margin)))
-        result.append(
-            (
-                "class:section",
-                box_line(f" Status: {status['text']}", width=width, margin=margin),
-            )
-        )
-        if progress["active"]:
-            result.append(("class:border", box_rule(width=width, margin=margin)))
-            for row in wrap_for_box(f" Current: {progress['label']}", width=width):
-                result.append(
-                    ("class:section", box_line(row, width=width, margin=margin))
-                )
-            bar = (progress["bar"] or "." * 20).replace("#", "█").replace(".", "░")
-            result.append(
-                (
-                    "class:progress",
-                    box_line(
-                        f" {bar}  {progress['percent']}", width=width, margin=margin
-                    ),
-                )
-            )
-            for row in wrap_for_box(f" {progress['detail']}", width=width):
-                result.append(
-                    ("class:muted", box_line(row, width=width, margin=margin))
-                )
-        result.append(("class:border", box_rule(width=width, margin=margin)))
-        for line in visible:
-            result.append(("class:normal", box_line(line, width=width, margin=margin)))
-        result.append(("class:border", box_rule(width=width, margin=margin)))
-        if status["returncode"] is None:
-            footer = f" Running... Ctrl-C: stop   Up/PageUp: scroll   Log: {log_path}"
-        else:
-            footer = f" Enter/Esc/q: return   Up/Down/PageUp/PageDown: scroll   Log: {log_path}"
-        result.append(("class:footer", box_line(footer, width=width, margin=margin)))
-        result.append(
-            ("class:border", box_rule(width=width, margin=margin, kind="bottom"))
-        )
-        return result
-
-    control = FormattedTextControl(fragments, focusable=True)
-    window = Window(control, wrap_lines=False, style="class:screen")
-    bindings = KeyBindings()
-    app = Application(
-        layout=Layout(HSplit([window], style="class:screen"), focused_element=window),
-        key_bindings=bindings,
-        style=ui_style(),
-        full_screen=True,
-        mouse_support=False,
-    )
-
-    def worker() -> None:
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        try:
-            proc = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE if stdin_text is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=env,
-            )
-            process_holder["process"] = proc
-            if stdin_text is not None and proc.stdin is not None:
-                proc.stdin.write(stdin_text)
-                proc.stdin.flush()
-                proc.stdin.close()
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                append_line(line)
-                app.invalidate()
-            returncode = proc.wait()
-            status["returncode"] = returncode
-            status["text"] = f"Finished with exit code {returncode}"
-        except Exception as exc:
-            status["returncode"] = 1
-            status["text"] = "Failed"
-            append_line(f"Error: {exc}")
-        finally:
-            app.invalidate()
-
-    def stop_process() -> None:
-        proc = process_holder.get("process")
-        if proc is not None and proc.poll() is None:
-            append_line("")
-            append_line("Stopping job...")
-            status["text"] = "Stopping"
-            proc.terminate()
-            app.invalidate()
-
-    @bindings.add("c-c")
-    def _interrupt(event):
-        if status["returncode"] is None:
-            stop_process()
-        else:
-            event.app.exit(result=status["returncode"])
-
-    @bindings.add("up")
-    @bindings.add("k")
-    def _scroll_up(event):
-        scroll["offset"] += 1
-        event.app.invalidate()
-
-    @bindings.add("down")
-    @bindings.add("j")
-    def _scroll_down(event):
-        scroll["offset"] = max(0, scroll["offset"] - 1)
-        event.app.invalidate()
-
-    @bindings.add("pageup")
-    def _page_up(event):
-        scroll["offset"] += max_log_rows
-        event.app.invalidate()
-
-    @bindings.add("pagedown")
-    def _page_down(event):
-        scroll["offset"] = max(0, scroll["offset"] - max_log_rows)
-        event.app.invalidate()
-
-    @bindings.add("end")
-    def _end(event):
-        scroll["offset"] = 0
-        event.app.invalidate()
-
-    @bindings.add("enter")
-    @bindings.add("escape")
-    @bindings.add("q")
-    def _back(event):
-        if status["returncode"] is None:
-            return
-        event.app.exit(result=status["returncode"])
-
-    threading.Thread(target=worker, daemon=True).start()
-    result = app.run()
-    return int(result or 0)
-
-
-def run_task_view(title: str, task: Callable[[Callable[[str], None]], object]):
-    if Application is None or not sys.stdin.isatty() or not sys.stdout.isatty():
-        return task(lambda line: print(line))
-
-    width = ui_width()
-    max_log_rows = max(8, shutil.get_terminal_size((100, 30)).lines - 13)
-    log_lines: list[str] = []
-    status = {"text": "Running", "done": False}
-    result_holder = {"result": None, "error": None}
-
-    def append_line(line: str) -> None:
-        for part in str(line).rstrip("\n").splitlines() or [""]:
-            if not part.strip():
-                continue
-            log_lines.append(part)
-        del log_lines[:-300]
-
-    def fragments():
-        margin = ui_margin(width)
-        visible = spaced_wrapped_rows(log_lines, width=width, max_rows=max_log_rows)
-        content_rows = 8 + len(visible)
-        top_padding = max(
-            0, (shutil.get_terminal_size((100, 30)).lines - content_rows) // 2
-        )
-        result = [("class:screen", "\n" * top_padding)]
-        result.append(
-            ("class:border", box_rule(width=width, margin=margin, kind="top"))
-        )
-        result.append(
-            ("class:title", box_line(f" {title} ", width=width, margin=margin))
-        )
-        result.append(("class:border", box_rule(width=width, margin=margin)))
-        result.append(
-            (
-                "class:section",
-                box_line(f" Status: {status['text']}", width=width, margin=margin),
-            )
-        )
-        result.append(("class:border", box_rule(width=width, margin=margin)))
-        for line in visible:
-            result.append(("class:normal", box_line(line, width=width, margin=margin)))
-        result.append(("class:border", box_rule(width=width, margin=margin)))
-        footer = " Working..." if not status["done"] else " Enter/Esc/q: continue"
-        result.append(("class:footer", box_line(footer, width=width, margin=margin)))
-        result.append(
-            ("class:border", box_rule(width=width, margin=margin, kind="bottom"))
-        )
-        return result
-
-    control = FormattedTextControl(fragments, focusable=True)
-    window = Window(control, wrap_lines=False, style="class:screen")
-    bindings = KeyBindings()
-    app = Application(
-        layout=Layout(HSplit([window], style="class:screen"), focused_element=window),
-        key_bindings=bindings,
-        style=ui_style(),
-        full_screen=True,
-        mouse_support=False,
-    )
-
-    def worker() -> None:
-        try:
-            result_holder["result"] = task(append_line)
-            status["text"] = "Finished"
-        except Exception as exc:
-            result_holder["error"] = exc
-            status["text"] = "Failed"
-            append_line(f"Error: {exc}")
-        finally:
-            status["done"] = True
-            app.invalidate()
-
-    @bindings.add("enter")
-    @bindings.add("escape")
-    @bindings.add("q")
-    def _continue(event):
-        if status["done"]:
-            event.app.exit()
-
-    @bindings.add("c-c")
-    def _interrupt(event):
-        if status["done"]:
-            event.app.exit()
-
-    threading.Thread(target=worker, daemon=True).start()
-    app.run()
-    if result_holder["error"] is not None:
-        raise result_holder["error"]
-    return result_holder["result"]
 
 
 def login_flow(state: MenuState) -> int:
@@ -1164,8 +719,8 @@ def refresh_resources_impl(state: MenuState, log: Callable[[str], None]) -> dict
 
 def refresh_resources(state: MenuState) -> dict | None:
     try:
-        return run_task_view(
-            "Firmware Lookup", lambda log: refresh_resources_impl(state, log)
+        return refresh_resources_impl(
+            state, lambda line: get_logger(__name__).info(line)
         )
     except Exception as exc:
         show_message("Firmware Lookup", str(exc))
@@ -1493,13 +1048,8 @@ def main_items() -> list[MenuItem]:
         ),
         MenuItem(
             "flash",
-            "Flash native Python backend",
-            "Runs the Software Fix flow through the native Sahara/Firehose backend.",
-        ),
-        MenuItem(
-            "whisky",
-            "Whisky/QFIL comparison flow",
-            "Prepares Lenovo's Windows QFIL bundle for comparison.",
+            "Flash native qfil backend",
+            "Runs the Software Fix flow through the native qfil package.",
         ),
         MenuItem(
             "settings", "Settings", "Edit token path, work dir, edl.py, and image dir."
@@ -1510,9 +1060,9 @@ def main_items() -> list[MenuItem]:
 
 
 def fallback_choose(title: str, items: list[MenuItem]) -> str | None:
-    print(f"\n{title}")
+    get_logger(__name__).info(f"\n{title}")
     for index, item in enumerate(items, 1):
-        print(f"{index}. {item.title} - {item.description}")
+        get_logger(__name__).info(f"{index}. {item.title} - {item.description}")
     value = input("Select: ").strip()
     if not value:
         return None
@@ -1525,7 +1075,7 @@ def fallback_main(state: MenuState) -> None:
     show_message(
         "LRSA Python",
         "prompt_toolkit is not installed, so arrow-key navigation is unavailable.\n\n"
-        "Install dependencies with: pip install -r requirements.txt",
+        "Install dependencies with: uv sync",
     )
     while True:
         choice = fallback_choose("LRSA Python", main_items())
@@ -1552,9 +1102,6 @@ def handle_choice(choice: str, state: MenuState) -> None:
         flash_flow(state)
     elif choice == "phone":
         phone_flow(state)
-    elif choice == "whisky":
-        if require_lookup_settings(state):
-            run_command(whisky_command(state))
     elif choice == "settings":
         configure(state)
     elif choice == "status":
@@ -1567,9 +1114,11 @@ def main() -> None:
         fallback_main(state)
         return
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print("lrsa-menu needs an interactive terminal for arrow-key navigation.")
-        print("Current settings:")
-        print(status_text(state))
+        get_logger(__name__).info(
+            "lrsa-menu needs an interactive terminal for arrow-key navigation."
+        )
+        get_logger(__name__).info("Current settings:")
+        get_logger(__name__).info(status_text(state))
         return
 
     while True:

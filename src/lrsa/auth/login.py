@@ -2,16 +2,18 @@
 """Login entrypoint for LRSA.
 
 Examples:
-  python3 -m lrsa.login --method guest
-  python3 -m lrsa.login --method lenovoid
-  python3 -m lrsa.login --method lenovoid --no-browser
+  python3 -m lrsa.auth.login --method guest
+  python3 -m lrsa.auth.login --method lenovoid
+  python3 -m lrsa.auth.login --method lenovoid --no-browser
 """
+
+from lrsa.logging import get_logger
 
 import argparse
 
-from .auth import lenovo_id_login, save_json
-from .client import LRSAClient
-from .config import DEFAULT_WORK_DIR
+from ..api.client import LRSAClient
+from ..config import DEFAULT_WORK_DIR
+from .session import lenovo_id_login, save_json
 
 
 def guest_login(client_uuid=None, account_id=None, include_init_token=False):
@@ -81,11 +83,13 @@ def main():
         )
 
     save_json(args.out, session)
-    print(f"Saved login session: {args.out}")
+    get_logger(__name__).info(f"Saved login session: {args.out}")
     if session.get("token"):
-        print("Token captured.")
+        get_logger(__name__).info("Token captured.")
     else:
-        print("No token captured; inspect saved responses for server errors.")
+        get_logger(__name__).info(
+            "No token captured; inspect saved responses for server errors."
+        )
 
 
 if __name__ == "__main__":

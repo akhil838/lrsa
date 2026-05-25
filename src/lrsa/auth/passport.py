@@ -8,6 +8,8 @@ URL that consumes an ``lpsust`` value, so this module probes that path without
 printing secret values.
 """
 
+from lrsa.logging import get_logger
+
 import argparse
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -16,14 +18,10 @@ import urllib.parse
 import requests
 import urllib3
 
-from .auth import save_json
+from .constants import DEFAULT_REALMS, INTERSERVER_ACCOUNT_URL
+from .session import save_json
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-INTERSERVER_ACCOUNT_URL = (
-    "https://passport.lenovo.com/interserver/authen/1.2/getaccountid"
-)
-DEFAULT_REALMS = ("lmsaclient", "lenovo.mbg.service.lmsa")
 
 
 def redact(value):
@@ -163,10 +161,10 @@ def main():
     }
     save_json(args.out, output)
 
-    print(f"Saved Passport probe: {args.out}")
+    get_logger(__name__).info(f"Saved Passport probe: {args.out}")
     for probe in probes:
         callback = probe.get("softwarefix_callback") or {}
-        print(
+        get_logger(__name__).info(
             f"{probe['realm']}: HTTP {probe['status']} "
             f"location={redact(probe.get('location'))} "
             f"authorization={redact(callback.get('authorization'))} "

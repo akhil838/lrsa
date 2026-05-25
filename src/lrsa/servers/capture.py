@@ -13,6 +13,8 @@ exchanges the authorization code, saves the token response, probes the LRSA
 Interface API, and then restores /etc/hosts.
 """
 
+from lrsa.logging import get_logger
+
 import argparse
 import base64
 import hashlib
@@ -35,28 +37,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 import urllib3
 
-from .client import LRSAClient
+from ..api.client import LRSAClient
+from ..auth.constants import (
+    CLIENT_ID,
+    INTERFACE_URL,
+    LENOVO_OAUTH_CALLBACK,
+    LENOVO_REALM,
+    LENOVO_SOURCE,
+    PASSPORT_HOST,
+    REDIRECT_URI,
+    SOFTWARE_FIX_DEVICE_ID,
+    TOKEN_ENDPOINT,
+)
+from .constants import (
+    CAPTURE_PORT,
+    CERT_FILE,
+    DEFAULT_CAPTURE_HOSTS,
+    DEFAULT_OUT_DIR,
+    FORWARD_TIMEOUT,
+    HOSTS_FILE,
+    KEY_FILE,
+)
 
 urllib3.disable_warnings()
 
-CLIENT_ID = "127cbff4e99dd5579db0627769509be972a3f38ad0dd11f2f2a7947516c923f0"
-REDIRECT_URI = "https://lsa.lenovo.com/Tips/lenovoIdSuccess.html"
-TOKEN_ENDPOINT = "https://passport-glb.lenovo.com/v1.0/utility/lenovoid/oauth2/token"
-INTERFACE_URL = "https://lsa.lenovo.com/Interface"
-LENOVO_REALM = "lenovo.mbg.service.lmsa"
-LENOVO_SOURCE = "Software Fix"
-LENOVO_OAUTH_CALLBACK = (
-    "https://passport-glb.lenovo.com/v1.0/utility/lenovoid/oauth2/callback"
-)
-SOFTWARE_FIX_DEVICE_ID = "a70868156b51ce83858f33957f7a1c29"
-HOSTS_FILE = "/etc/hosts"
-PASSPORT_HOST = "passport-glb.lenovo.com"
-DEFAULT_CAPTURE_HOSTS = ("lsa.lenovo.com",)
-CAPTURE_HOSTS = DEFAULT_CAPTURE_HOSTS
-CERT_FILE = "/tmp/lsa_cert.pem"
-KEY_FILE = "/tmp/lsa_key.pem"
-DEFAULT_OUT_DIR = Path("lrsa_work/capture")
-FORWARD_TIMEOUT = 30
+capture_hosts = DEFAULT_CAPTURE_HOSTS
 
 
 def redact(value):
@@ -201,7 +206,9 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         event = self._record_event()
-        print(f"[capture] GET {event['host']}{event['path']} query={event['query']}")
+        get_logger(__name__).info(
+            f"[capture] GET {event['host']}{event['path']} query={event['query']}"
+        )
 
         if (
             event["host"] == "lsa.lenovo.com"
@@ -213,8 +220,10 @@ class CaptureHandler(BaseHTTPRequestHandler):
             CaptureHandler.auth_scope = params.get("scope", [None])[0]
             CaptureHandler.auth_code_at = time.time()
             if CaptureHandler.auth_code:
-                print(f"\n[+] CAPTURED CODE: {redact(CaptureHandler.auth_code)}")
-                print(f"[+] STATE: {CaptureHandler.auth_state}")
+                get_logger(__name__).info(
+                    f"\n[+] CAPTURED CODE: {redact(CaptureHandler.auth_code)}"
+                )
+                get_logger(__name__).info(f"[+] STATE: {CaptureHandler.auth_state}")
             # Serve a self-contained page that performs the same browser-side
             # sequence as Lenovo's success page:
             #   /Tips/lmsa/tips/getOauth2Url.jhtml
@@ -223,7 +232,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
             # protocol button while preserving the required state setup.
             upstream_response = self._request_upstream(event, send_to_browser=False)
             self._send_capture_page(upstream_response=upstream_response)
-        elif event["host"] in CAPTURE_HOSTS:
+        elif event["host"] in capture_hosts:
             self._forward_to_upstream(event)
         else:
             self.send_response(404)
@@ -234,8 +243,10 @@ class CaptureHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         body = raw.decode("utf-8", errors="replace") if raw else None
         event = self._record_event(body=body)
-        print(f"[capture] POST {event['host']}{event['path']} bytes={length}")
-        if event["host"] in CAPTURE_HOSTS:
+        get_logger(__name__).info(
+            f"[capture] POST {event['host']}{event['path']} bytes={length}"
+        )
+        if event["host"] in capture_hosts:
             self._forward_to_upstream(event, raw_body=raw)
         else:
             self.send_response(404)
@@ -283,7 +294,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 self.send_response(502)
                 self.end_headers()
                 self.wfile.write(str(exc).encode("utf-8", errors="replace"))
-            print(f"[forward] {host}{event['path']} failed: {exc}")
+            get_logger(__name__).info(f"[forward] {host}{event['path']} failed: {exc}")
             return None
 
         forwarded_event = {
@@ -297,7 +308,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
             with open(self.events_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(forwarded_event, separators=(",", ":")))
                 f.write("\n")
-        print(
+        get_logger(__name__).info(
             f"[forward] {host}{event['path']} -> HTTP {response.status_code} "
             f"location={response.headers.get('Location', '')[:160]}"
         )
@@ -350,7 +361,9 @@ class CaptureHandler(BaseHTTPRequestHandler):
         CaptureHandler.softwarefix_callback = callback
         token = callback.get("Authorization")
         if token:
-            print(f"\n[+] CAPTURED SOFTWARE FIX TOKEN: {redact(token)}")
+            get_logger(__name__).info(
+                f"\n[+] CAPTURED SOFTWARE FIX TOKEN: {redact(token)}"
+            )
         else:
             code = payload.get("code") if isinstance(payload, dict) else None
             desc = (
@@ -358,7 +371,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 if isinstance(payload, dict)
                 else response.text[:120]
             )
-            print(
+            get_logger(__name__).info(
                 f"\n[-] Software Fix callback response had no Authorization: code={code} desc={desc}"
             )
 
@@ -368,7 +381,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
 
 def generate_cert():
     """Generate self-signed cert for captured Lenovo OAuth hosts."""
-    alt_names = ",".join(f"DNS:{host}" for host in CAPTURE_HOSTS)
+    alt_names = ",".join(f"DNS:{host}" for host in capture_hosts)
     subprocess.run(
         [
             "openssl",
@@ -390,13 +403,15 @@ def generate_cert():
         ],
         capture_output=True,
     )
-    print(f"[+] Generated self-signed cert for {', '.join(CAPTURE_HOSTS)}")
+    get_logger(__name__).info(
+        "[+] Generated self-signed cert for %s", ", ".join(capture_hosts)
+    )
 
 
 def resolve_upstream_hosts():
     resolved = {}
-    for host in CAPTURE_HOSTS:
-        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    for host in capture_hosts:
+        infos = socket.getaddrinfo(host, CAPTURE_PORT, type=socket.SOCK_STREAM)
         for info in infos:
             ip = info[4][0]
             if ":" not in ip:
@@ -410,12 +425,12 @@ def resolve_upstream_hosts():
 def add_hosts_entry():
     with open(HOSTS_FILE, "r") as f:
         content = f.read()
-    missing = [host for host in CAPTURE_HOSTS if f"127.0.0.1 {host}" not in content]
+    missing = [host for host in capture_hosts if f"127.0.0.1 {host}" not in content]
     if missing:
         with open(HOSTS_FILE, "a") as f:
             for host in missing:
                 f.write(f"\n127.0.0.1 {host}\n")
-                print(f"[+] Added '127.0.0.1 {host}' to /etc/hosts")
+                get_logger(__name__).info(f"[+] Added '127.0.0.1 {host}' to /etc/hosts")
     # Flush DNS cache
     subprocess.run(["dscacheutil", "-flushcache"], capture_output=True)
     subprocess.run(["killall", "-HUP", "mDNSResponder"], capture_output=True)
@@ -426,11 +441,11 @@ def remove_hosts_entry():
         lines = f.readlines()
     with open(HOSTS_FILE, "w") as f:
         for line in lines:
-            if not any(f"127.0.0.1 {host}" in line for host in CAPTURE_HOSTS):
+            if not any(f"127.0.0.1 {host}" in line for host in capture_hosts):
                 f.write(line)
     subprocess.run(["dscacheutil", "-flushcache"], capture_output=True)
     subprocess.run(["killall", "-HUP", "mDNSResponder"], capture_output=True)
-    print("[+] Removed hosts entry, restored DNS")
+    get_logger(__name__).info("[+] Removed hosts entry, restored DNS")
 
 
 def generate_pkce():
@@ -569,17 +584,17 @@ def exchange_code(code, verifier):
         },
         verify=False,
     )
-    print(f"\n[*] Token exchange: {r.status_code}")
+    get_logger(__name__).info(f"\n[*] Token exchange: {r.status_code}")
     if r.status_code == 200:
         return r.json()
-    print(f"    Response: {r.text[:500]}")
+    get_logger(__name__).info(f"    Response: {r.text[:500]}")
     return None
 
 
 def test_firmware(token, client_uuid):
     """Test token on firmware API — need to remove hosts entry first so we hit real server."""
     remove_hosts_entry()
-    print("\n[*] Testing token on real lsa.lenovo.com...")
+    get_logger(__name__).info("\n[*] Testing token on real lsa.lenovo.com...")
 
     headers = {
         "Content-Type": "application/json",
@@ -637,17 +652,19 @@ def test_firmware(token, client_uuid):
             if isinstance(result["json"], dict)
             else r.text[:80]
         )
-        print(f"  {ep}: HTTP {r.status_code} code={code} desc={desc}")
+        get_logger(__name__).info(
+            f"  {ep}: HTTP {r.status_code} code={code} desc={desc}"
+        )
         if isinstance(result["json"], dict):
             data = result["json"]
             if data.get("code") == "0000":
-                print("\n[+] FIRMWARE DATA!")
-                print(json.dumps(data, indent=2))
+                get_logger(__name__).info("\n[+] FIRMWARE DATA!")
+                get_logger(__name__).info(json.dumps(data, indent=2))
     return results
 
 
 def main():
-    global CAPTURE_HOSTS
+    global capture_hosts
 
     parser = argparse.ArgumentParser(
         description="Capture Lenovo ID OAuth callback for LRSA"
@@ -689,16 +706,18 @@ def main():
     )
     args = parser.parse_args()
     if args.capture_passport:
-        CAPTURE_HOSTS = DEFAULT_CAPTURE_HOSTS + (PASSPORT_HOST,)
+        capture_hosts = DEFAULT_CAPTURE_HOSTS + (PASSPORT_HOST,)
 
     if os.geteuid() != 0:
-        print("Need sudo to modify /etc/hosts and bind port 443")
-        print("Run: sudo python3 -m lrsa.capture_server")
+        get_logger(__name__).error(
+            "Need sudo to modify /etc/hosts and bind port %s", CAPTURE_PORT
+        )
+        get_logger(__name__).info("Run: sudo python3 -m lrsa.servers.capture")
         sys.exit(1)
 
-    print("=" * 60)
-    print("LRSA OAuth Code Capture Server")
-    print("=" * 60)
+    get_logger(__name__).info("=" * 60)
+    get_logger(__name__).info("LRSA OAuth Code Capture Server")
+    get_logger(__name__).info("=" * 60)
     CaptureHandler.auth_code = None
     CaptureHandler.auth_state = None
     CaptureHandler.auth_scope = None
@@ -707,15 +726,15 @@ def main():
     CaptureHandler.softwarefix_callback = None
     args.out_dir.mkdir(parents=True, exist_ok=True)
     CaptureHandler.events_path = args.out_dir / "events.jsonl"
-    print(f"[+] Capture log: {CaptureHandler.events_path}")
-    print(f"[+] Capturing hosts: {', '.join(CAPTURE_HOSTS)}")
+    get_logger(__name__).info(f"[+] Capture log: {CaptureHandler.events_path}")
+    get_logger(__name__).info("[+] Capturing hosts: %s", ", ".join(capture_hosts))
     if args.capture_passport:
-        print(
+        get_logger(__name__).info(
             "[!] passport-glb.lenovo.com uses HSTS; normal browsers will block the local cert."
         )
 
     CaptureHandler.upstream_ips = resolve_upstream_hosts()
-    print(f"[+] Upstream IPs: {CaptureHandler.upstream_ips}")
+    get_logger(__name__).info(f"[+] Upstream IPs: {CaptureHandler.upstream_ips}")
 
     # Generate the browser login URL before /etc/hosts points lsa.lenovo.com at
     # this capture server. Software Fix obtains this URL from the LRSA API.
@@ -728,21 +747,23 @@ def main():
     google_url = build_software_fix_google_url(ctx_encoded, device_id)
     login_seed = None
 
-    print(f"[+] PKCE generated, state: {state}")
+    get_logger(__name__).info(f"[+] PKCE generated, state: {state}")
     if args.login_url_mode == "software-fix-api":
         auth_url, login_seed = fetch_software_fix_login_url(client_uuid)
         save_json(args.out_dir / "login_url_response.json", login_seed)
         parsed_auth = urllib.parse.urlparse(auth_url)
         parsed_auth_query = urllib.parse.parse_qs(parsed_auth.query)
         state = parsed_auth_query.get("state", [state])[0]
-        print(f"[+] Software Fix login URL fetched from TIP_URL, state: {state}")
+        get_logger(__name__).info(
+            f"[+] Software Fix login URL fetched from TIP_URL, state: {state}"
+        )
     elif args.login_url_mode == "direct-oauth":
         auth_url = build_direct_oauth_url(state, challenge, device_id)
     elif args.login_url_mode == "software-fix-google":
         auth_url = google_url
     else:
         auth_url = prelogin_url
-        print(f"[+] LenovoID context: {ctx_plain}")
+        get_logger(__name__).info(f"[+] LenovoID context: {ctx_plain}")
 
     # Save PKCE / launch metadata for debugging.
     save_json(
@@ -766,7 +787,7 @@ def main():
 
     # Cleanup on exit
     def cleanup(sig=None, frame=None):
-        print("\n[*] Cleaning up...")
+        get_logger(__name__).info("\n[*] Cleaning up...")
         remove_hosts_entry()
         sys.exit(0)
 
@@ -774,57 +795,65 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
 
     try:
-        # Start HTTPS server on port 443
+        # Start HTTPS server on the capture port.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(CERT_FILE, KEY_FILE)
 
-        server = HTTPServer(("0.0.0.0", 443), CaptureHandler)
+        server = HTTPServer(("0.0.0.0", CAPTURE_PORT), CaptureHandler)
         server.socket = context.wrap_socket(server.socket, server_side=True)
         server.timeout = 1
-        print("[+] HTTPS server running on :443")
+        get_logger(__name__).info("[+] HTTPS server running on :%s", CAPTURE_PORT)
 
         # Open browser or wait for the real Software Fix client to do it.
         if args.external_login:
-            print("\n[*] External Software Fix login mode.")
-            print("[*] Start login from the installed Software Fix client now.")
-            print("[*] This listener will capture the final lsa.lenovo.com callback.")
+            get_logger(__name__).info("\n[*] External Software Fix login mode.")
+            get_logger(__name__).info(
+                "[*] Start login from the installed Software Fix client now."
+            )
+            get_logger(__name__).info(
+                "[*] This listener will capture the final lsa.lenovo.com callback."
+            )
         else:
-            print("\n[*] Login URL:")
-            print(auth_url)
+            get_logger(__name__).info("\n[*] Login URL:")
+            get_logger(__name__).info(auth_url)
         if args.login_url_mode == "software-fix-api":
-            print("[*] This URL was returned by Lenovo's Software Fix API (TIP_URL).")
-            print(
+            get_logger(__name__).info(
+                "[*] This URL was returned by Lenovo's Software Fix API (TIP_URL)."
+            )
+            get_logger(__name__).info(
                 "[*] If lsa.lenovo.com shows a certificate warning, accept it for this test."
             )
         elif args.login_url_mode == "software-fix-prelogin":
-            print(
+            get_logger(__name__).info(
                 "\n[*] ThirdOauth URL (do not open directly unless preLogin does not navigate):"
             )
-            print(google_url)
-            print("\n[*] PreLogin URL:")
-            print(prelogin_url)
-            print(
+            get_logger(__name__).info(google_url)
+            get_logger(__name__).info("\n[*] PreLogin URL:")
+            get_logger(__name__).info(prelogin_url)
+            get_logger(__name__).info(
                 "[*] If lsa.lenovo.com shows a certificate warning, accept it for this test."
             )
         if not args.no_browser and not args.external_login:
             webbrowser.open(auth_url)
 
         # Wait for callback
-        print("[*] Waiting for OAuth callback...")
+        get_logger(__name__).info("[*] Waiting for OAuth callback...")
         while CaptureHandler.softwarefix_callback_result is None:
             server.handle_request()
             if (
                 CaptureHandler.auth_code_at
                 and time.time() - CaptureHandler.auth_code_at > 45
             ):
-                print("[!] Timed out waiting for browser-side Software Fix callback.")
+                get_logger(__name__).info(
+                    "[!] Timed out waiting for browser-side Software Fix callback."
+                )
                 break
 
         code = CaptureHandler.auth_code
         if not code:
-            print("\n[-] OAuth callback was not captured.")
+            get_logger(__name__).info("\n[-] OAuth callback was not captured.")
             return
-        print(f"\n[+] Got code: {code[:50]}...")
+        get_logger(__name__).info(f"\n[+] Got code: {code[:50]}...")
 
         # Restore DNS before making our own token/API calls, otherwise the
         # Python requests client would hit this local capture server.
@@ -837,15 +866,15 @@ def main():
         callback = callback_result.get("softwarefix_callback") or {}
         access_token = callback.get("Authorization")
         save_json(args.out_dir / "callback_response.json", callback_result)
-        print(
+        get_logger(__name__).info(
             f"[+] Software Fix callback response saved: {args.out_dir / 'callback_response.json'}"
         )
         if access_token:
-            print(f"\n{'=' * 60}")
-            print(f"[+] SOFTWARE FIX TOKEN: {redact(access_token)}")
+            get_logger(__name__).info(f"\n{'=' * 60}")
+            get_logger(__name__).info(f"[+] SOFTWARE FIX TOKEN: {redact(access_token)}")
 
             save_json(args.out_dir / "token_response.json", callback_result)
-            print(
+            get_logger(__name__).info(
                 f"[+] Callback response saved: {args.out_dir / 'token_response.json'}"
             )
 
@@ -861,18 +890,24 @@ def main():
                 "interface_results": interface_results,
             }
             save_json(args.out_dir / "login_session.json", session)
-            print(f"[+] Session saved: {args.out_dir / 'login_session.json'}")
+            get_logger(__name__).info(
+                f"[+] Session saved: {args.out_dir / 'login_session.json'}"
+            )
         else:
-            print("\n[-] Software Fix callback did not return Authorization")
+            get_logger(__name__).info(
+                "\n[-] Software Fix callback did not return Authorization"
+            )
             raw = callback_result.get("raw") or callback_result.get("decrypted") or ""
             payload = callback_result.get("json")
             if isinstance(payload, dict):
-                print(f"    code={payload.get('code')} desc={payload.get('desc')}")
+                get_logger(__name__).info(
+                    f"    code={payload.get('code')} desc={payload.get('desc')}"
+                )
                 content = payload.get("content") or payload.get("msg")
                 if content:
-                    print(f"    content={str(content)[:240]}")
+                    get_logger(__name__).info(f"    content={str(content)[:240]}")
             elif raw:
-                print(f"    response={raw[:240]}")
+                get_logger(__name__).info(f"    response={raw[:240]}")
 
     finally:
         cleanup()

@@ -19,6 +19,8 @@ Flow:
 6. Use access_token as Bearer for /Interface/ API
 """
 
+from lrsa.logging import get_logger
+
 import webbrowser
 import urllib.parse
 import hashlib
@@ -29,15 +31,16 @@ import sys
 import requests
 import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from .constants import (
+    AUTH_ENDPOINT,
+    CLIENT_ID,
+    INTERFACE_URL,
+    REDIRECT_URI,
+    SCOPE,
+    TOKEN_ENDPOINT,
+)
 
-# OAuth2 configuration (extracted from LRSA)
-AUTH_ENDPOINT = "https://passport-glb.lenovo.com/v1.0/utility/lenovoid/oauth2/authorize"
-TOKEN_ENDPOINT = "https://passport-glb.lenovo.com/v1.0/utility/lenovoid/oauth2/token"
-CLIENT_ID = "127cbff4e99dd5579db0627769509be972a3f38ad0dd11f2f2a7947516c923f0"
-REDIRECT_URI = "https://lsa.lenovo.com/Tips/lenovoIdSuccess.html"
-SCOPE = "openid"
-INTERFACE_URL = "https://lsa.lenovo.com/Interface"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def generate_pkce():
@@ -71,7 +74,7 @@ def build_auth_url(state, code_challenge):
 
 def exchange_code_for_token(code, code_verifier):
     """Exchange authorization code for access token using PKCE."""
-    print("\n[*] Exchanging code for access token...")
+    get_logger(__name__).info("\n[*] Exchanging code for access token...")
 
     data = {
         "grant_type": "authorization_code",
@@ -82,8 +85,8 @@ def exchange_code_for_token(code, code_verifier):
     }
 
     r = requests.post(TOKEN_ENDPOINT, data=data, verify=False)
-    print(f"    Status: {r.status_code}")
-    print(f"    Response: {r.text[:500]}")
+    get_logger(__name__).info(f"    Status: {r.status_code}")
+    get_logger(__name__).info(f"    Response: {r.text[:500]}")
 
     if r.status_code == 200:
         try:
@@ -97,10 +100,10 @@ def exchange_code_for_token(code, code_verifier):
             pass
 
     # Try with JSON content type
-    print("\n[*] Retry with JSON content type...")
+    get_logger(__name__).info("\n[*] Retry with JSON content type...")
     r = requests.post(TOKEN_ENDPOINT, json=data, verify=False)
-    print(f"    Status: {r.status_code}")
-    print(f"    Response: {r.text[:500]}")
+    get_logger(__name__).info(f"    Status: {r.status_code}")
+    get_logger(__name__).info(f"    Response: {r.text[:500]}")
 
     if r.status_code == 200:
         try:
@@ -113,8 +116,8 @@ def exchange_code_for_token(code, code_verifier):
 
 def test_firmware_api(token):
     """Test the token against firmware download API."""
-    print(f"\n{'=' * 60}")
-    print("[*] Testing token on LRSA firmware API...")
+    get_logger(__name__).info(f"\n{'=' * 60}")
+    get_logger(__name__).info("[*] Testing token on LRSA firmware API...")
 
     headers = {
         "Content-Type": "application/json",
@@ -143,51 +146,57 @@ def test_firmware_api(token):
         try:
             data = r.json()
             status_icon = "+" if data.get("code") == "0000" else "-"
-            print(
+            get_logger(__name__).info(
                 f"  [{status_icon}] {path}: code={data.get('code')} {str(data)[:150]}"
             )
             if data.get("code") == "0000":
-                print(f"\n[+] SUCCESS on {path}!")
-                print(json.dumps(data, indent=2))
+                get_logger(__name__).info(f"\n[+] SUCCESS on {path}!")
+                get_logger(__name__).info(json.dumps(data, indent=2))
                 return data
         except Exception:
-            print(f"  [?] {path}: {r.status_code} {r.text[:100]}")
+            get_logger(__name__).info(f"  [?] {path}: {r.status_code} {r.text[:100]}")
 
     return None
 
 
 def main():
-    print("=" * 60)
-    print("LRSA Python Client — OAuth2 PKCE Login")
-    print("=" * 60)
+    get_logger(__name__).info("=" * 60)
+    get_logger(__name__).info("LRSA Python Client — OAuth2 PKCE Login")
+    get_logger(__name__).info("=" * 60)
 
     # Step 1: Generate PKCE
     code_verifier, code_challenge = generate_pkce()
     state = str(__import__("uuid").uuid4())
 
-    print(f"[*] State: {state}")
-    print(f"[*] Code verifier: {code_verifier[:20]}...")
-    print(f"[*] Code challenge: {code_challenge}")
+    get_logger(__name__).info(f"[*] State: {state}")
+    get_logger(__name__).info(f"[*] Code verifier: {code_verifier[:20]}...")
+    get_logger(__name__).info(f"[*] Code challenge: {code_challenge}")
 
     # Step 2: Open browser
     auth_url = build_auth_url(state, code_challenge)
-    print("\n[*] Opening browser for login...")
+    get_logger(__name__).info("\n[*] Opening browser for login...")
     webbrowser.open(auth_url)
 
-    print()
-    print("=" * 60)
-    print("After logging in, you'll be redirected to a page that says:")
-    print("  'Please go to the client to check the login process'")
-    print()
-    print("COPY the full URL from browser address bar and paste below.")
-    print("It should look like:")
-    print("  https://lsa.lenovo.com/Tips/lenovoIdSuccess.html?code=XXXXX&...")
-    print("=" * 60)
+    get_logger(__name__).info("")
+    get_logger(__name__).info("=" * 60)
+    get_logger(__name__).info(
+        "After logging in, you'll be redirected to a page that says:"
+    )
+    get_logger(__name__).info("  'Please go to the client to check the login process'")
+    get_logger(__name__).info("")
+    get_logger(__name__).info(
+        "COPY the full URL from browser address bar and paste below."
+    )
+    get_logger(__name__).info("It should look like:")
+    get_logger(__name__).info(
+        "  https://lsa.lenovo.com/Tips/lenovoIdSuccess.html?code=XXXXX&..."
+    )
+    get_logger(__name__).info("=" * 60)
 
     # Read from stdin if available, otherwise prompt
     if not sys.stdin.isatty():
-        print("\n[!] Non-interactive mode. Pass URL as argument:")
-        print("    python3 -m lrsa.oauth --url <CALLBACK_URL>")
+        get_logger(__name__).info("\n[!] Non-interactive mode. Pass URL as argument:")
+        get_logger(__name__).info("    python3 -m lrsa.auth.oauth --url <CALLBACK_URL>")
         return
 
     url = input("\nPaste callback URL: ").strip()
@@ -197,18 +206,18 @@ def main():
     code = parsed.get("code", [None])[0]
 
     if not code:
-        print("[-] No 'code' parameter found in URL!")
+        get_logger(__name__).info("[-] No 'code' parameter found in URL!")
         return
 
-    print(f"[+] Got authorization code: {code[:40]}...")
+    get_logger(__name__).info(f"[+] Got authorization code: {code[:40]}...")
 
     # Step 3: Exchange for token
     token_data = exchange_code_for_token(code, code_verifier)
 
     if token_data:
         access_token = token_data.get("access_token") or token_data.get("id_token")
-        print("\n[+] ACCESS TOKEN OBTAINED!")
-        print(f"    Token: {str(access_token)[:80]}...")
+        get_logger(__name__).info("\n[+] ACCESS TOKEN OBTAINED!")
+        get_logger(__name__).info(f"    Token: {str(access_token)[:80]}...")
 
         # Save
         with open("lrsa_token.json", "w") as f:
@@ -222,13 +231,15 @@ def main():
                 f,
                 indent=2,
             )
-        print("[+] Saved to lrsa_token.json")
+        get_logger(__name__).info("[+] Saved to lrsa_token.json")
 
         # Step 4: Test on firmware API
         test_firmware_api(access_token)
     else:
-        print("\n[-] Token exchange failed.")
-        print("[*] The code might have expired. Try again quickly after login.")
+        get_logger(__name__).info("\n[-] Token exchange failed.")
+        get_logger(__name__).info(
+            "[*] The code might have expired. Try again quickly after login."
+        )
 
 
 if __name__ == "__main__":
@@ -249,7 +260,9 @@ if __name__ == "__main__":
                         token = result.get("access_token") or result.get("id_token")
                         test_firmware_api(token)
                 except FileNotFoundError:
-                    print("No saved PKCE state. Run without --url first.")
+                    get_logger(__name__).info(
+                        "No saved PKCE state. Run without --url first."
+                    )
     elif "--token" in sys.argv:
         idx = sys.argv.index("--token") + 1
         if idx < len(sys.argv):

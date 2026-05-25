@@ -5,16 +5,17 @@ Logs all requests/responses including auth headers.
 LRSA's BaseHttpUrl is changed to http://127.0.0.1:9999
 """
 
+from lrsa.logging import get_logger
+
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import json
 import urllib3
 import sys
 
-urllib3.disable_warnings()
+from .constants import HTTP_RELAY_PORT, REAL_BASE
 
-REAL_BASE = "https://lsa.lenovo.com"
-LISTEN_PORT = 9999
+urllib3.disable_warnings()
 
 
 class RelayHandler(BaseHTTPRequestHandler):
@@ -27,17 +28,17 @@ class RelayHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length) if content_length > 0 else None
 
         # Log request
-        print(f"\n{'=' * 60}")
-        print(f">>> {method} {self.path}")
-        print(f">>> Real URL: {real_url}")
+        get_logger(__name__).debug("\n%s", "=" * 60)
+        get_logger(__name__).debug(">>> %s %s", method, self.path)
+        get_logger(__name__).debug(">>> Real URL: %s", real_url)
         for k, v in self.headers.items():
             if k.lower() not in ["host", "accept-encoding"]:
-                print(f">>> {k}: {v}")
+                get_logger(__name__).debug(">>> %s: %s", k, v)
         if body:
             try:
-                print(f">>> Body: {body.decode('utf-8')[:500]}")
+                get_logger(__name__).debug(">>> Body: %s", body.decode("utf-8")[:500])
             except Exception:
-                print(f">>> Body: ({len(body)} bytes binary)")
+                get_logger(__name__).debug(">>> Body: (%s bytes binary)", len(body))
 
         # Forward to real server
         headers = dict(self.headers)
@@ -53,7 +54,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 )
 
             # Log response
-            print(f"\n<<< Status: {r.status_code}")
+            get_logger(__name__).info("Relay response status: %s", r.status_code)
             for k, v in r.headers.items():
                 if k.lower() in [
                     "set-cookie",
@@ -61,18 +62,22 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "location",
                     "content-type",
                 ]:
-                    print(f"<<< {k}: {v}")
+                    get_logger(__name__).debug("<<< %s: %s", k, v)
             if r.text and len(r.text) < 1000:
-                print(f"<<< Body: {r.text}")
+                get_logger(__name__).debug("<<< Body: %s", r.text)
             else:
-                print(f"<<< Body: ({len(r.text)} chars)")
+                get_logger(__name__).debug("<<< Body: (%s chars)", len(r.text))
 
             # Check for token in response
             try:
                 data = r.json()
                 if "token" in str(data).lower() or "bearer" in str(data).lower():
-                    print("\n!!! TOKEN FOUND IN RESPONSE !!!")
-                    print(f"!!! {json.dumps(data, indent=2)}")
+                    get_logger(__name__).warning(
+                        "Possible token found in relay response"
+                    )
+                    get_logger(__name__).debug(
+                        "Token response payload: %s", json.dumps(data, indent=2)
+                    )
             except Exception:
                 pass
 
@@ -86,12 +91,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 ]:
                     self.send_header(k, v)
             response_body = r.content
-            self.send_header("Content-Length", len(response_body))
+            self.send_header("Content-Length", str(len(response_body)))
             self.end_headers()
             self.wfile.write(response_body)
 
-        except Exception as e:
-            print(f"\n!!! ERROR: {e}")
+        except Exception:
+            get_logger(__name__).exception("Relay request failed")
             self.send_response(502)
             self.end_headers()
             self.wfile.write(b"Relay error")
@@ -109,11 +114,11 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"LRSA Relay Server starting on :{LISTEN_PORT}")
-    print(f"Forwarding to {REAL_BASE}")
-    print("Waiting for LRSA connections...\n")
-    server = HTTPServer(("127.0.0.1", LISTEN_PORT), RelayHandler)
+    get_logger(__name__).info(f"LRSA Relay Server starting on :{HTTP_RELAY_PORT}")
+    get_logger(__name__).info(f"Forwarding to {REAL_BASE}")
+    get_logger(__name__).info("Waiting for LRSA connections...\n")
+    server = HTTPServer(("127.0.0.1", HTTP_RELAY_PORT), RelayHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down.")
+        get_logger(__name__).info("\nShutting down.")
