@@ -62,6 +62,7 @@ from textual.widgets import (
     Label,
     Log,
     ProgressBar,
+    RichLog,
     Static,
 )
 from qfil import (
@@ -2235,6 +2236,16 @@ class LRSATextualApp(App):
         margin-left: 2;
     }
 
+    #log-panel {
+        width: 56;
+        min-width: 30;
+        height: 100%;
+        border: solid #b8b8b8;
+        padding: 1;
+        margin-left: 2;
+        background: #0f0f0f;
+    }
+
     #identity-panel {
         height: auto;
         border: solid #333333;
@@ -2425,18 +2436,28 @@ class LRSATextualApp(App):
         margin-bottom: 1;
     }
 
+    #log-header {
+        height: auto;
+        margin-bottom: 1;
+    }
+
     #log-title {
+        width: 1fr;
         color: #ff3b30;
         text-style: bold;
-        margin-bottom: 1;
+        content-align: left middle;
+    }
+
+    #log-wrap {
+        width: 10;
+        min-width: 8;
     }
 
     #log {
         height: 1fr;
-        min-height: 8;
         border: solid #333333;
         padding: 1;
-        background: #0f0f0f;
+        background: #111111;
         color: #d8d8d8;
     }
     """
@@ -2454,6 +2475,7 @@ class LRSATextualApp(App):
         ("d", "dry_run", "Dry run"),
         ("p", "download_rom", "Download"),
         ("s", "save_settings", "Save settings"),
+        ("w", "toggle_log_wrap", "Wrap log"),
     ]
 
     WORKFLOW_LABELS = {
@@ -2481,6 +2503,7 @@ class LRSATextualApp(App):
         self.selected_firmware_index: int | None = None
         self.selected_device_index: int | None = None
         self.firmware_size_cache: dict[int, str] = {}
+        self.log_wrap = True
 
     @property
     def identity_input_ids(self) -> tuple[str, ...]:
@@ -2584,8 +2607,18 @@ class LRSATextualApp(App):
                     yield Static("Errors / Activity", id="firmware-log-title")
                     yield Log(id="firmware-log", highlight=True, max_lines=500)
                 yield Static("", id="status")
-                yield Static("Command Log", id="log-title")
-                yield Log(id="log", highlight=True, max_lines=5000, auto_scroll=True)
+            with Vertical(id="log-panel"):
+                with Horizontal(id="log-header"):
+                    yield Static("Command Log", id="log-title")
+                    yield Button("Wrap On", id="log-wrap", compact=True)
+                yield RichLog(
+                    id="log",
+                    highlight=True,
+                    max_lines=5000,
+                    auto_scroll=True,
+                    wrap=True,
+                    min_width=140,
+                )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -2623,16 +2656,22 @@ class LRSATextualApp(App):
         self.narrow_layout = narrow
 
         sidebar_width = 22 if tiny else 24 if narrow else 30
+        log_width = 30 if tiny else 40 if narrow else 56
         sidebar = self.query_one("#sidebar", VerticalScroll)
         workspace = self.query_one("#workspace", VerticalScroll)
+        log_panel = self.query_one("#log-panel", Vertical)
         actions = self.query_one("#actions", Vertical)
         sidebar.styles.width = sidebar_width
+        log_panel.styles.width = log_width
         workspace.styles.margin = (0, 0, 0, 1 if narrow else 2)
+        log_panel.styles.margin = (0, 0, 0, 1 if narrow else 2)
         workspace.styles.padding = (0, 1) if tiny else (1, 2)
+        log_panel.styles.padding = (0, 1) if tiny else (1, 1)
         actions.styles.margin = (0, 0, 0, 0) if dense else (1, 0, 0, 0)
         identity_title = self.query_one("#identity-title", Static)
         identity_title.update("" if narrow else "Device Identity")
         identity_title.styles.width = 0 if narrow else "1fr"
+        self.query_one("#log-title", Static).update("Log" if tiny else "Command Log")
 
         for button_id, labels in self.WORKFLOW_LABELS.items():
             button = self.query_one(f"#{button_id}", Button)
@@ -2648,20 +2687,31 @@ class LRSATextualApp(App):
             "firmware-refresh",
             "download-selected",
             "firmware-back",
+            "log-wrap",
         ):
             self.query_one(f"#{button_id}", Button).compact = dense or narrow
 
     def write_log(self, line: str) -> None:
-        self.query_one("#log", Log).write_line(line)
+        self.query_one("#log", RichLog).write(line)
 
     def write_firmware_log(self, line: str) -> None:
         self.query_one("#firmware-log-title").display = True
         self.query_one("#firmware-log").display = True
         self.query_one("#firmware-log", Log).write_line(line)
+        self.write_log(line)
 
     def clear_log(self, title: str) -> None:
         self.query_one("#log-title", Static).update(title)
-        self.query_one("#log", Log).clear()
+        self.query_one("#log", RichLog).clear()
+
+    def toggle_log_wrap(self) -> None:
+        self.log_wrap = not self.log_wrap
+        log = self.query_one("#log", RichLog)
+        log.wrap = self.log_wrap
+        self.query_one("#log-wrap", Button).label = (
+            "Wrap On" if self.log_wrap else "No Wrap"
+        )
+        self.write_log(f"Log wrapping {'enabled' if self.log_wrap else 'disabled'}.")
 
     def clear_firmware_log(self) -> None:
         self.query_one("#firmware-log", Log).clear()
@@ -3243,6 +3293,8 @@ class LRSATextualApp(App):
         elif button_id == "save":
             self.show_main_workspace()
             self.save_identity_edits()
+        elif button_id == "log-wrap":
+            self.toggle_log_wrap()
         elif button_id == "dry-run":
             self.show_main_workspace()
             self.run_lrsa_args("Dry Run", dry_run_args(self.state))
@@ -3322,6 +3374,9 @@ class LRSATextualApp(App):
         self.show_main_workspace()
         self.save_settings_from_inputs()
         self.write_log("Settings saved.")
+
+    def action_toggle_log_wrap(self) -> None:
+        self.toggle_log_wrap()
 
 
 def main() -> None:
