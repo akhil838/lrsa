@@ -64,6 +64,7 @@ from textual.widgets import (
     ProgressBar,
     RichLog,
     Static,
+    TextArea,
 )
 from qfil import (
     build_qfil_module_command,
@@ -2215,37 +2216,61 @@ class LRSATextualApp(App):
         color: #d8d8d8;
     }
 
+    /* ── Top-level 3-column layout ── */
     #body {
         height: 1fr;
-        padding: 1 2;
+        padding: 1 1;
     }
 
     #sidebar {
         width: 30;
-        min-width: 28;
-        height: 100%;
+        min-width: 22;
+        height: 1fr;
         border: solid #b8b8b8;
         padding: 1 2;
     }
 
     #workspace {
-        width: 1fr;
-        height: 100%;
+        width: 2fr;
+        height: 1fr;
         border: solid #b8b8b8;
         padding: 1 2;
-        margin-left: 2;
+        margin-left: 1;
     }
 
     #log-panel {
-        width: 56;
+        width: 2fr;
         min-width: 30;
-        height: 100%;
+        height: 1fr;
         border: solid #b8b8b8;
-        padding: 1;
-        margin-left: 2;
+        padding: 1 1;
+        margin-left: 1;
         background: #0f0f0f;
     }
 
+    /* ── Sidebar ── */
+    .title {
+        color: #ff3b30;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .section-title {
+        color: #d8d8d8;
+        text-style: bold;
+        margin: 1 0 1 0;
+    }
+
+    #actions {
+        margin-top: 1;
+    }
+
+    #actions Button {
+        width: 100%;
+        margin: 0 0 1 0;
+    }
+
+    /* ── Identity panel ── */
     #identity-panel {
         height: auto;
         border: solid #333333;
@@ -2283,6 +2308,30 @@ class LRSATextualApp(App):
         height: auto;
     }
 
+    .field {
+        height: auto;
+    }
+
+    .field-label {
+        color: #9a9a9a;
+        margin: 0;
+    }
+
+    Input {
+        height: 3;
+        border: tall #444444;
+        padding: 0 1;
+        margin-bottom: 0;
+        width: 100%;
+        background: #1a1a1a;
+        color: #e0e0e0;
+    }
+
+    Input:focus {
+        border: tall #ff3b30;
+    }
+
+    /* ── Device panel ── */
     #device-panel {
         height: auto;
         border: solid #333333;
@@ -2312,47 +2361,11 @@ class LRSATextualApp(App):
         color: #d8d8d8;
     }
 
-    .field {
-        height: auto;
-    }
-
-    .title {
-        color: #ff3b30;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-
-    .section-title {
-        color: #d8d8d8;
-        text-style: bold;
-        margin: 1 0 1 0;
-    }
-
-    .field-label {
-        color: #9a9a9a;
-        margin: 0 0 0 0;
-    }
-
-    Input {
-        height: 1;
-        border: none;
-        padding: 0 1;
-        margin-bottom: 0;
-        width: 100%;
-    }
-
-    #actions {
-        margin-top: 1;
-    }
-
-    #actions Button {
-        width: 100%;
-        margin: 0 0 1 0;
-    }
-
+    /* ── Firmware panel (hidden by default, replaces main workspace content) ── */
     #firmware-panel {
         display: none;
-        height: 1fr;
+        height: auto;
+        min-height: 20;
         border: solid #333333;
         padding: 1;
         background: #0f0f0f;
@@ -2377,7 +2390,8 @@ class LRSATextualApp(App):
     }
 
     #firmware-table {
-        height: 1fr;
+        height: auto;
+        min-height: 10;
         margin-bottom: 1;
     }
 
@@ -2415,27 +2429,15 @@ class LRSATextualApp(App):
         margin: 0 0 1 0;
     }
 
-    #firmware-log-title {
-        display: none;
-        color: #ff3b30;
-        text-style: bold;
-        margin-top: 1;
-    }
 
-    #firmware-log {
-        display: none;
-        height: 5;
-        border: solid #333333;
-        background: #111111;
-        color: #d8d8d8;
-    }
-
+    /* ── Status bar ── */
     #status {
         height: auto;
         color: #c8c8c8;
         margin-bottom: 1;
     }
 
+    /* ── Log panel ── */
     #log-header {
         height: auto;
         margin-bottom: 1;
@@ -2470,11 +2472,9 @@ class LRSATextualApp(App):
         ("4", "download_rom", "Download"),
         ("5", "extract_rom", "Extract"),
         ("6", "flash", "Flash"),
-        ("7", "save_settings", "Save"),
-        ("8", "quit", "Quit"),
+        ("7", "quit", "Quit"),
         ("d", "dry_run", "Dry run"),
         ("p", "download_rom", "Download"),
-        ("s", "save_settings", "Save settings"),
         ("w", "toggle_log_wrap", "Wrap log"),
     ]
 
@@ -2485,8 +2485,7 @@ class LRSATextualApp(App):
         "download": ("4. Download ROM", "4. Download"),
         "extract": ("5. Extract ROM", "5. Extract"),
         "flash": ("6. Flash local firmware", "6. Flash"),
-        "save": ("7. Save settings", "7. Save"),
-        "exit": ("8. Exit", "8. Exit"),
+        "exit": ("7. Exit", "7. Exit"),
     }
 
     def __init__(self, state: MenuState) -> None:
@@ -2504,6 +2503,7 @@ class LRSATextualApp(App):
         self.selected_device_index: int | None = None
         self.firmware_size_cache: dict[int, str] = {}
         self.log_wrap = True
+        self._log_lines: list[str] = []
 
     @property
     def identity_input_ids(self) -> tuple[str, ...]:
@@ -2522,8 +2522,7 @@ class LRSATextualApp(App):
                     yield Button("4. Download ROM", id="download")
                     yield Button("5. Extract ROM", id="extract")
                     yield Button("6. Flash local firmware", id="flash", variant="error")
-                    yield Button("7. Save settings", id="save", variant="primary")
-                    yield Button("8. Exit", id="exit")
+                    yield Button("7. Exit", id="exit")
             with VerticalScroll(id="workspace"):
                 with Vertical(id="identity-panel"):
                     with Horizontal(id="identity-header"):
@@ -2549,38 +2548,38 @@ class LRSATextualApp(App):
                             yield Input(
                                 value=self.state.model,
                                 id="model",
+                                placeholder="e.g. 2201123G",
                                 disabled=True,
-                                compact=True,
                             )
                         with Vertical(classes="field"):
                             yield Label("Serial number", classes="field-label")
                             yield Input(
                                 value=self.state.sn,
                                 id="sn",
+                                placeholder="e.g. a1b2c3d4",
                                 disabled=True,
-                                compact=True,
                             )
                         with Vertical(classes="field"):
                             yield Label("IMEI", classes="field-label")
                             yield Input(
                                 value=self.state.imei,
                                 id="imei",
+                                placeholder="15 digits",
                                 disabled=True,
-                                compact=True,
                             )
                         with Vertical(classes="field"):
                             yield Label("IMEI2", classes="field-label")
                             yield Input(
                                 value=self.state.imei2,
                                 id="imei2",
+                                placeholder="15 digits",
                                 disabled=True,
-                                compact=True,
                             )
                         with Vertical(classes="field"):
                             yield Label(
                                 "sudo password for Login", classes="field-label"
                             )
-                            yield Input(password=True, id="sudo-password", compact=True)
+                            yield Input(password=True, id="sudo-password", placeholder="optional")
                 with Vertical(id="device-panel"):
                     with Horizontal(id="device-header"):
                         yield Static("Device State", id="device-title")
@@ -2604,20 +2603,17 @@ class LRSATextualApp(App):
                     yield Static("", id="firmware-detail")
                     yield Static("", id="download-progress-label")
                     yield ProgressBar(total=100, id="download-progress")
-                    yield Static("Errors / Activity", id="firmware-log-title")
-                    yield Log(id="firmware-log", highlight=True, max_lines=500)
                 yield Static("", id="status")
             with Vertical(id="log-panel"):
                 with Horizontal(id="log-header"):
                     yield Static("Command Log", id="log-title")
                     yield Button("Wrap On", id="log-wrap", compact=True)
-                yield RichLog(
+                yield TextArea(
                     id="log",
-                    highlight=True,
-                    max_lines=5000,
-                    auto_scroll=True,
-                    wrap=True,
-                    min_width=140,
+                    read_only=True,
+                    soft_wrap=True,
+                    show_line_numbers=False,
+                    theme="monokai",
                 )
         yield Footer()
 
@@ -2626,7 +2622,7 @@ class LRSATextualApp(App):
         table = self.query_one("#firmware-table", DataTable)
         table.cursor_type = "row"
         table.add_column("#", key="index", width=4)
-        table.add_column("Firmware", key="firmware")
+        table.add_column("Firmware", key="firmware", width=40)
         table.add_column("Model", key="model", width=14)
         table.add_column("Mode", key="mode", width=12)
         table.add_column("Published", key="published", width=19)
@@ -2636,7 +2632,7 @@ class LRSATextualApp(App):
         device_table.add_column("Mode", key="mode", width=10)
         device_table.add_column("Serial", key="serial", width=22)
         device_table.add_column("State", key="state", width=24)
-        device_table.add_column("Detail", key="detail")
+        device_table.add_column("Detail", key="detail", width=30)
         self.apply_responsive_layout()
         self.refresh_status()
         self.refresh_device_scan()
@@ -2650,28 +2646,18 @@ class LRSATextualApp(App):
 
     def apply_responsive_layout(self) -> None:
         width, height = self.size
-        narrow = width < 96
+        narrow = width < 120
         dense = height < 32
-        tiny = width < 78 or height < 24
+        tiny = width < 80 or height < 24
         self.narrow_layout = narrow
 
-        sidebar_width = 22 if tiny else 24 if narrow else 30
-        log_width = 30 if tiny else 40 if narrow else 56
         sidebar = self.query_one("#sidebar", VerticalScroll)
-        workspace = self.query_one("#workspace", VerticalScroll)
-        log_panel = self.query_one("#log-panel", Vertical)
-        actions = self.query_one("#actions", Vertical)
-        sidebar.styles.width = sidebar_width
-        log_panel.styles.width = log_width
-        workspace.styles.margin = (0, 0, 0, 1 if narrow else 2)
-        log_panel.styles.margin = (0, 0, 0, 1 if narrow else 2)
-        workspace.styles.padding = (0, 1) if tiny else (1, 2)
-        log_panel.styles.padding = (0, 1) if tiny else (1, 1)
-        actions.styles.margin = (0, 0, 0, 0) if dense else (1, 0, 0, 0)
+        sidebar.styles.width = 22 if tiny else 24 if narrow else 30
+
+        self.query_one("#log-title", Static).update("Log" if tiny else "Command Log")
         identity_title = self.query_one("#identity-title", Static)
         identity_title.update("" if narrow else "Device Identity")
         identity_title.styles.width = 0 if narrow else "1fr"
-        self.query_one("#log-title", Static).update("Log" if tiny else "Command Log")
 
         for button_id, labels in self.WORKFLOW_LABELS.items():
             button = self.query_one(f"#{button_id}", Button)
@@ -2692,31 +2678,37 @@ class LRSATextualApp(App):
             self.query_one(f"#{button_id}", Button).compact = dense or narrow
 
     def write_log(self, line: str) -> None:
-        self.query_one("#log", RichLog).write(line)
+        self._log_lines.append(line)
+        max_lines = 5000
+        if len(self._log_lines) > max_lines:
+            self._log_lines = self._log_lines[-max_lines:]
+        log = self.query_one("#log", TextArea)
+        if log.text:
+            log.insert(f"\n{line}", log.document.end)
+        else:
+            log.insert(line, log.document.end)
+        log.scroll_end(animate=False)
 
     def write_firmware_log(self, line: str) -> None:
-        self.query_one("#firmware-log-title").display = True
-        self.query_one("#firmware-log").display = True
-        self.query_one("#firmware-log", Log).write_line(line)
         self.write_log(line)
 
     def clear_log(self, title: str) -> None:
         self.query_one("#log-title", Static).update(title)
-        self.query_one("#log", RichLog).clear()
+        log = self.query_one("#log", TextArea)
+        log.clear()
+        self._log_lines.clear()
 
     def toggle_log_wrap(self) -> None:
         self.log_wrap = not self.log_wrap
-        log = self.query_one("#log", RichLog)
-        log.wrap = self.log_wrap
+        log = self.query_one("#log", TextArea)
+        log.soft_wrap = self.log_wrap
         self.query_one("#log-wrap", Button).label = (
             "Wrap On" if self.log_wrap else "No Wrap"
         )
         self.write_log(f"Log wrapping {'enabled' if self.log_wrap else 'disabled'}.")
 
     def clear_firmware_log(self) -> None:
-        self.query_one("#firmware-log", Log).clear()
-        self.query_one("#firmware-log-title").display = False
-        self.query_one("#firmware-log").display = False
+        pass
 
     def refresh_status(self) -> None:
         terminal_size = f"{self.size.width}x{self.size.height}"
@@ -2790,13 +2782,23 @@ class LRSATextualApp(App):
         self.set_identity_editing(False)
         self.write_log("Device identity reverted.")
 
+    def focus_device_identity(self) -> None:
+        if self.busy:
+            return
+        self.set_identity_editing(True)
+        self.write_log("Device identity unlocked for editing.")
+
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
+        always_enabled = {"log-wrap"}
         for button in self.query(Button):
+            if button.id in always_enabled:
+                continue
             button.disabled = busy
         self.set_identity_editing(self.editing_identity)
         if self.query_one("#firmware-panel").display:
             self.update_firmware_detail()
+            self.update_firmware_action_state()
 
     def run_lrsa_args(self, title: str, args: list[str]) -> None:
         if self.busy:
@@ -2836,14 +2838,10 @@ class LRSATextualApp(App):
         self.flash_armed = False
         self.query_one("#firmware-panel").display = False
         self.query_one("#status").display = True
-        self.query_one("#log-title").display = True
-        self.query_one("#log").display = True
 
     def show_firmware_workspace(self) -> None:
         self.query_one("#firmware-panel").display = True
         self.query_one("#status").display = False
-        self.query_one("#log-title").display = False
-        self.query_one("#log").display = False
 
     def reset_download_progress(self) -> None:
         progress_label = self.query_one("#download-progress-label", Static)
@@ -3238,17 +3236,17 @@ class LRSATextualApp(App):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def focus_device_identity(self) -> None:
-        if self.busy:
-            return
-        self.set_identity_editing(True)
-        self.write_log("Device identity unlocked for editing.")
 
     def run_capture(self) -> None:
         if self.busy:
             return
         self.save_settings_from_inputs()
-        password = self.query_one("#sudo-password", Input).value
+        pwd_input = self.query_one("#sudo-password", Input)
+        password = pwd_input.value
+        if not password:
+            self.write_log("Enter sudo password before Login.")
+            pwd_input.focus()
+            return
         self.clear_log("Login / Capture")
         self.write_log(quote_command(login_command(self.state)))
         self.set_busy(True)
@@ -3290,9 +3288,6 @@ class LRSATextualApp(App):
         elif button_id == "revert-fields":
             self.show_main_workspace()
             self.revert_identity_edits()
-        elif button_id == "save":
-            self.show_main_workspace()
-            self.save_identity_edits()
         elif button_id == "log-wrap":
             self.toggle_log_wrap()
         elif button_id == "dry-run":
@@ -3370,10 +3365,6 @@ class LRSATextualApp(App):
         self.show_main_workspace()
         self.refresh_device_scan()
 
-    def action_save_settings(self) -> None:
-        self.show_main_workspace()
-        self.save_settings_from_inputs()
-        self.write_log("Settings saved.")
 
     def action_toggle_log_wrap(self) -> None:
         self.toggle_log_wrap()
