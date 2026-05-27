@@ -60,9 +60,7 @@ from textual.widgets import (
     Header,
     Input,
     Label,
-    Log,
     ProgressBar,
-    RichLog,
     Static,
     TextArea,
 )
