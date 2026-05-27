@@ -2577,7 +2577,11 @@ class LRSATextualApp(App):
                             yield Label(
                                 "sudo password for Login", classes="field-label"
                             )
-                            yield Input(password=True, id="sudo-password", placeholder="optional")
+                            yield Input(
+                                password=True,
+                                id="sudo-password",
+                                placeholder="optional",
+                            )
                 with Vertical(id="device-panel"):
                     with Horizontal(id="device-header"):
                         yield Static("Device State", id="device-title")
@@ -3234,7 +3238,6 @@ class LRSATextualApp(App):
 
         threading.Thread(target=worker, daemon=True).start()
 
-
     def run_capture(self) -> None:
         if self.busy:
             return
@@ -3362,7 +3365,6 @@ class LRSATextualApp(App):
     def action_scan_devices(self) -> None:
         self.show_main_workspace()
         self.refresh_device_scan()
-
 
     def action_toggle_log_wrap(self) -> None:
         self.toggle_log_wrap()
