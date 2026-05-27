@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Inventory, decompile, and port audit for the bundled Lenovo/QFIL tools.
+"""Inventory and static-analysis audit for bundled Lenovo/QFIL tools.
 
 Records file coverage, PE/.NET metadata, imports, embedded strings, URLs,
 environment-like names, and the feature delta against this repository's native
-Python qfil module for the 1v1 port effort.
+Python qfil module for the 1:1 behavioral port effort.
 """
 
 from __future__ import annotations
@@ -308,7 +308,7 @@ def summarize_coverage(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def compare_python_port(root: Path) -> list[dict[str, str]]:
+def compare_python_port(source_root: Path) -> list[dict[str, str]]:
     """Static, conservative feature gap checklist from the native indicators."""
     qfil_files = [
         Path("qfil/protocol/sahara.py"),
@@ -319,7 +319,7 @@ def compare_python_port(root: Path) -> list[dict[str, str]]:
     ]
     source = "\n".join(
         path.read_text(encoding="utf-8", errors="ignore")
-        for path in qfil_files
+        for path in _qfil_source_paths(source_root, qfil_files)
         if path.exists()
     ).lower()
     checks = [
@@ -329,23 +329,37 @@ def compare_python_port(root: Path) -> list[dict[str, str]]:
         ),
         ("Sahara reset state machine packet", ("reset_req",)),
         (
-            "Sahara command execution / serial read commandop01.bin",
-            ("commandop01", "cmd_exec"),
+            "Sahara command execution",
+            ("execute_command", "cmd_exec"),
         ),
+        ("QSahara command output file naming commandopXX.bin", ("commandop",)),
         ("Sahara memory dump mode", ("memdump",)),
-        ("COM port selection / Windows QDLoader abstraction", ("--port", "com")),
+        ("COM port CLI compatibility", ("--port",)),
+        ("Windows QDLoader COM transport", ("serialport", "qdloader")),
         (
             "Firehose configure MemoryName/ZLPAwareHost",
             ("memoryname", "zlpawarehost", "configure"),
         ),
+        (
+            "Firehose configure verbose/skip/max-payload flags",
+            ("verbose", "skip_storage_init", "max_payload_to_target"),
+        ),
+        ("Firehose nop command", ("def nop", "<nop")),
         ("Firehose set bootable storage drive", ("setbootablestoragedrive",)),
         ("Firehose program payload streaming", ("program(", "sparseimagereader")),
         ("Firehose patch XML handling", ("patch_file",)),
         ("Firehose erase XML command", ("def erase",)),
-        ("Firehose read XML command", ("<read", "def read")),
+        ("Firehose read XML command", ('elem.tag == "read"', "read_to_file")),
+        ("Firehose getstorageinfo command", ("get_storage_info", "getstorageinfo")),
         (
-            "Firehose getstorageinfo/fixgpt/firmwarewrite/verify",
-            ("getstorageinfo", "fixgpt", "firmwarewrite", "verify_programming"),
+            "Firehose firmwarewrite file streaming",
+            ("firmwarewrite", "write_file_element"),
+        ),
+        ("Firehose fixgpt command", ("fixgpt",)),
+        ("Firehose verify programming", ("verify_programming",)),
+        (
+            "Firehose response log extraction",
+            ("root.findall", ".//log", "logs"),
         ),
         (
             "Firehose XML tag sorting full fh_loader behavior",
@@ -368,6 +382,11 @@ def compare_python_port(root: Path) -> list[dict[str, str]]:
             }
         )
     return out
+
+
+def _qfil_source_paths(source_root: Path, qfil_files: list[Path]) -> list[Path]:
+    roots = [source_root, source_root / "src"]
+    return [root / path for path in qfil_files for root in roots]
 
 
 def write_markdown(
@@ -398,9 +417,9 @@ def write_markdown(
     inventory.write_text("\n".join(inventory_lines) + "\n", encoding="utf-8")
 
     report_lines = [
-        "# Native QFIL / Software Fix Decompile And Port Audit",
+        "# Native QFIL / Software Fix Static Analysis And Port Audit",
         "",
-        "This audit catalogs shipped files, decompiled metadata, imports, strings, URLs, environment-like tokens, protocol indicators, and Python port coverage.",
+        "This audit catalogs shipped files, PE/.NET metadata, imports, strings, URLs, environment-like tokens, protocol indicators, and Python port coverage.",
         "",
         "## Coverage Summary",
         "",
@@ -493,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_QFIL_AUDIT_ROOT)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_QFIL_AUDIT_OUTPUT)
+    parser.add_argument("--qfil-source-root", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
 
     root = args.root.resolve()
@@ -502,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     files = sorted(path for path in root.rglob("*") if path.is_file())
     items = [analyze_file(path, root) for path in files]
     summary = summarize_coverage(items)
-    gaps = compare_python_port(root)
+    gaps = compare_python_port(args.qfil_source_root.resolve())
 
     (out_dir / "native_qfil_analysis.json").write_text(
         json.dumps(items, indent=2, sort_keys=True), encoding="utf-8"
