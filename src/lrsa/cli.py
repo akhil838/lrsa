@@ -21,7 +21,7 @@ from .api.resources import (
     resource_summary,
 )
 from .device.flow_checks import validate_fastboot_recipe_checks
-from .device.preflight import format_usb_devices, require_qualcomm_edl_device
+from .device.preflight import ensure_qualcomm_edl_device, format_usb_devices
 from .config import (
     DEFAULT_MODEL,
     DEFAULT_SN,
@@ -37,9 +37,9 @@ from qfil import (
     build_qfil_module_command,
     parse_program_entries,
     parse_rescue_cmd,
-    run_qfil_plan,
     summarize_plan,
 )
+from qfil.tools.qfil import run_qfil_plan
 from .flash.software_fix_flow import (
     is_mobile_or_tablet,
     load_flow,
@@ -67,6 +67,94 @@ def resource_match_preflight(
         )
 
 
+def find_rescue_cmd(root: Path) -> Path | None:
+    for path in root.rglob("*"):
+        if path.is_file() and path.name.lower() == "rescue.cmd":
+            return path
+    return None
+
+
+def run_qfil_image_plan(
+    *,
+    base_dir: Path,
+    startup_file: Path | None,
+    loader: Path | None,
+    flash: bool,
+    skip_edl_preflight: bool,
+) -> None:
+    native_base_dir = base_dir.resolve()
+    if not native_base_dir.exists():
+        raise RuntimeError(
+            f"Native qfil image directory does not exist: {native_base_dir}"
+        )
+    startup = startup_file or find_rescue_cmd(native_base_dir)
+    if startup is None:
+        raise RuntimeError(f"No Rescue.cmd found under {native_base_dir}")
+    startup = startup.resolve()
+    native_image_dir = resolve_qfil_image_dir(native_base_dir, startup)
+    if not native_image_dir.exists():
+        raise RuntimeError(
+            f"Native qfil image directory does not exist: {native_image_dir}"
+        )
+    qfil_plan = parse_rescue_cmd(startup, native_image_dir)
+    if (
+        loader
+        and qfil_plan.programmer
+        and loader.resolve() != qfil_plan.programmer.loader
+    ):
+        raise RuntimeError(
+            "Refusing loader override because Rescue.cmd provides the official programmer: "
+            f"{qfil_plan.programmer.loader}"
+        )
+    get_logger(__name__).info("\nSoftware Fix qfil compatibility plan:")
+    for line in summarize_plan(qfil_plan):
+        get_logger(__name__).info(f"  {line}")
+    rawprograms = list(qfil_plan.firehose.rawprograms)
+    patches = list(qfil_plan.firehose.patches)
+    command = build_qfil_module_command(qfil_plan)
+    missing_xml = [
+        str(path) for path in [*rawprograms, *patches] if not Path(path).exists()
+    ]
+    if missing_xml:
+        raise RuntimeError(
+            f"Native qfil XML preflight failed under {native_image_dir}: missing {', '.join(missing_xml)}"
+        )
+    get_logger(__name__).info("\nNative Python Sahara/Firehose plan:")
+    get_logger(__name__).info(
+        f"Rawprogram XMLs: {', '.join(p.name for p in rawprograms)}"
+    )
+    get_logger(__name__).info(
+        f"Patch XMLs: {', '.join(p.name for p in patches) if patches else '(none)'}"
+    )
+    program_entries = parse_program_entries(rawprograms)
+    if program_entries:
+        get_logger(__name__).info(f"Program entries: {len(program_entries)}")
+        get_logger(__name__).info("Program order:")
+        for entry in program_entries[:24]:
+            sectors = entry.sectors if entry.sectors is not None else "dynamic"
+            get_logger(__name__).info(
+                f"  {entry.xml.name}: {entry.filename} -> {entry.label} "
+                f"lun={entry.lun} sector={entry.start_sector} sectors={sectors}"
+            )
+        if len(program_entries) > 24:
+            get_logger(__name__).info(f"  ... {len(program_entries) - 24} more entries")
+    get_logger(__name__).info(" ".join(command))
+    if flash:
+        if not skip_edl_preflight:
+            devices = ensure_qualcomm_edl_device()
+            get_logger(__name__).info(
+                f"EDL preflight passed: {format_usb_devices(devices)}"
+            )
+        get_logger(__name__).info(
+            "\nExecuting native flash. Device must already be in Qualcomm 9008 EDL mode."
+        )
+        run_qfil_plan(qfil_plan, dry_run=False)
+    else:
+        get_logger(__name__).info(
+            "\nDry run only. Add --flash to execute native flashing."
+        )
+
+
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Run LRSA login -> firmware -> QFIL workflow"
@@ -87,6 +175,11 @@ def main(argv: list[str] | None = None):
         "--image-dir",
         type=Path,
         help="Use an existing extracted firmware/image directory",
+    )
+    parser.add_argument(
+        "--startup-file",
+        type=Path,
+        help="Rescue.cmd path to use with --image-dir/--skip-api.",
     )
     parser.add_argument("--stock-dir", type=Path, default=DEFAULT_STOCK_DIR)
     parser.add_argument("--token")
@@ -158,7 +251,7 @@ def main(argv: list[str] | None = None):
             token = extract_token_from_file(args.token_file)
         except (OSError, ValueError) as exc:
             parser.error(f"Could not read --token-file {args.token_file}: {exc}")
-    elif args.login == "lenovoid" and not args.only_login:
+    elif args.login == "lenovoid" and not args.only_login and not args.skip_api:
         session = run_lenovoid_login(
             open_browser=not args.no_browser,
             client_uuid=args.client_uuid,
@@ -263,8 +356,17 @@ def main(argv: list[str] | None = None):
         else:
             get_logger(__name__).info("No firmware URL found in response.")
     else:
+        if args.skip_api and args.image_dir:
+            get_logger(__name__).info("Skipping LRSA API calls.")
+            run_qfil_image_plan(
+                base_dir=args.image_dir,
+                startup_file=args.startup_file,
+                loader=args.loader,
+                flash=args.flash,
+                skip_edl_preflight=args.skip_edl_preflight,
+            )
+            return
         get_logger(__name__).info("Skipping LRSA API calls.")
-
     if args.flow == "software-fix":
         if not resource:
             raise RuntimeError(
@@ -419,7 +521,7 @@ def main(argv: list[str] | None = None):
         get_logger(__name__).info(" ".join(command))
         if args.flash:
             if not args.skip_edl_preflight:
-                devices = require_qualcomm_edl_device()
+                devices = ensure_qualcomm_edl_device()
                 get_logger(__name__).info(
                     f"EDL preflight passed: {format_usb_devices(devices)}"
                 )
