@@ -260,6 +260,7 @@ QListWidget#Sidebar::item:selected {
 }
 """
 
+
 def _session_token(session: dict[str, Any] | None) -> str | None:
     if not session:
         return None
@@ -294,6 +295,7 @@ def configure_table(table: QTableWidget, *, min_height: int = MIN_TABLE_HEIGHT) 
     header.setHighlightSections(False)
     header.setStretchLastSection(True)
     header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
 
 class DevicePoller(QThread):
     devices_changed = Signal(list)
@@ -348,8 +350,6 @@ class GuestLoginWorker(QThread):
             self.failed.emit(str(exc))
 
 
-
-
 class LogoutWorker(QThread):
     finished_with_results = Signal(list)
 
@@ -387,7 +387,9 @@ class CatalogBrowseWorker(QThread):
             client_uuid = None
             if self._session and self._session.get("client_uuid"):
                 client_uuid = str(self._session["client_uuid"])
-            client = LRSAClient(client_uuid=client_uuid, token=_session_token(self._session))
+            client = LRSAClient(
+                client_uuid=client_uuid, token=_session_token(self._session)
+            )
 
             if self._action == "markets":
                 self.output.emit(f"Loading catalog markets for {self._category}...")
@@ -420,7 +422,9 @@ class CatalogBrowseWorker(QThread):
                 raise RuntimeError(
                     f"Catalog API failed: code={code or '(none)'} desc={desc or '(none)'}"
                 )
-            self.finished_with_catalog.emit(self._action, catalog_strings(api, keys), api)
+            self.finished_with_catalog.emit(
+                self._action, catalog_strings(api, keys), api
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -456,7 +460,9 @@ class FirmwareLookupWorker(QThread):
             return client.get_resources_by_imei(self._imei, self._imei2 or None)
         if not self._model or not self._sn:
             raise RuntimeError("SN lookup requires Model and SN, or use IMEI lookup.")
-        self.output.emit(f"Querying rescue ROM by SN: model={self._model}, sn={self._sn}")
+        self.output.emit(
+            f"Querying rescue ROM by SN: model={self._model}, sn={self._sn}"
+        )
         return client.get_rescue_rom(self._model, self._sn)
 
     def _bootstrap_guest(self, client_uuid: str | None) -> dict[str, Any]:
@@ -468,7 +474,9 @@ class FirmwareLookupWorker(QThread):
             from lrsa.api.client import LRSAClient
             from lrsa.api.firmware import response_payload
 
-            active_session = dict(self._session) if isinstance(self._session, dict) else None
+            active_session = (
+                dict(self._session) if isinstance(self._session, dict) else None
+            )
             client_uuid = None
             if active_session and active_session.get("client_uuid"):
                 client_uuid = str(active_session["client_uuid"])
@@ -539,6 +547,7 @@ class PrepareWorker(QThread):
 
     def run(self) -> None:
         try:
+
             def progress_callback(
                 stage: str, current: int, total: int | None, label: str
             ) -> None:
@@ -557,6 +566,7 @@ class PrepareWorker(QThread):
             self.finished_with_manifest.emit(manifest)
         except Exception as exc:
             self.failed.emit(str(exc))
+
 
 class CommandWorker(QThread):
     output = Signal(str)
@@ -702,7 +712,9 @@ class LoginSessionWatcher(QThread):
     session_file_ready = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, session_file: Path, *, started_at: float, timeout_seconds: int = 600) -> None:
+    def __init__(
+        self, session_file: Path, *, started_at: float, timeout_seconds: int = 600
+    ) -> None:
         super().__init__()
         self._session_file = session_file
         self._started_at = started_at
@@ -806,9 +818,8 @@ class MainWindow(QMainWindow):
         width = min(1280, max(760, available.width() - margin))
         height = min(860, max(560, available.height() - margin))
         saved_window = self._gui_state.get("window")
-        if (
-            self._gui_state.get("layout_version") == LAYOUT_STATE_VERSION
-            and isinstance(saved_window, dict)
+        if self._gui_state.get("layout_version") == LAYOUT_STATE_VERSION and isinstance(
+            saved_window, dict
         ):
             saved_width = saved_window.get("width")
             saved_height = saved_window.get("height")
@@ -884,6 +895,7 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidget(page)
         self.page_stack.addWidget(scroll)
+
     def _switch_page(self, index: int) -> None:
         if index < 0:
             return
@@ -907,7 +919,9 @@ class MainWindow(QMainWindow):
             self._session_worker,
         ):
             if worker is not None and worker.isRunning():
-                if isinstance(worker, (CommandWorker, CaptureLoginWorker, LoginSessionWatcher)):
+                if isinstance(
+                    worker, (CommandWorker, CaptureLoginWorker, LoginSessionWatcher)
+                ):
                     worker.stop()
                 worker.wait(2000)
         self._device_poller.stop()
@@ -988,7 +1002,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
         dialog.exec()
 
-
     def _build_devices_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1003,9 +1016,13 @@ class MainWindow(QMainWindow):
         self.device_table = QTableWidget(0, len(DEVICE_COLUMNS))
         self.device_table.setHorizontalHeaderLabels(DEVICE_COLUMNS)
         configure_table(self.device_table, min_height=220)
-        self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.device_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
         self.device_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.device_table.itemSelectionChanged.connect(self._show_selected_device_details)
+        self.device_table.itemSelectionChanged.connect(
+            self._show_selected_device_details
+        )
         layout.addWidget(self.device_table)
 
         details_group = QGroupBox("Selected device details")
@@ -1040,16 +1057,16 @@ class MainWindow(QMainWindow):
         self.sn_input.setPlaceholderText("Serial number")
         self.imei_input.setPlaceholderText("IMEI")
         self.imei2_input.setPlaceholderText("Optional second IMEI")
-        self.guest_fallback_check = QCheckBox(
-            "Use guest login if no session is loaded"
-        )
+        self.guest_fallback_check = QCheckBox("Use guest login if no session is loaded")
         self.guest_fallback_check.setChecked(True)
         self.lookup_button = QPushButton("List ROMs")
         self.lookup_button.clicked.connect(self._lookup_firmware)
         self.catalog_category = QComboBox()
         for label, value in CATEGORY_OPTIONS:
             self.catalog_category.addItem(label, value)
-        self.catalog_category.currentIndexChanged.connect(self._catalog_category_changed)
+        self.catalog_category.currentIndexChanged.connect(
+            self._catalog_category_changed
+        )
         self.catalog_market = QComboBox()
         self.catalog_market.currentIndexChanged.connect(self._catalog_market_changed)
         self.catalog_model = QComboBox()
@@ -1091,9 +1108,13 @@ class MainWindow(QMainWindow):
         self.resource_table = QTableWidget(0, len(RESOURCE_COLUMNS))
         self.resource_table.setHorizontalHeaderLabels(RESOURCE_COLUMNS)
         configure_table(self.resource_table, min_height=240)
-        self.resource_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.resource_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
         self.resource_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.resource_table.itemSelectionChanged.connect(self._show_selected_resource_details)
+        self.resource_table.itemSelectionChanged.connect(
+            self._show_selected_resource_details
+        )
         rom_list_layout.addWidget(self.resource_table)
         rom_list_group.setMinimumWidth(270)
         results_layout.addWidget(rom_list_group, 2)
@@ -1124,7 +1145,9 @@ class MainWindow(QMainWindow):
             str(self._work_dir() / "software_fix" / "downloads")
         )
         self.download_dir_input.setReadOnly(True)
-        self.download_dir_input.setPlaceholderText("Choose where firmware archives are saved")
+        self.download_dir_input.setPlaceholderText(
+            "Choose where firmware archives are saved"
+        )
         self.download_dir_button = QPushButton("Choose")
         self.download_dir_button.clicked.connect(self._pick_download_dir)
 
@@ -1139,7 +1162,9 @@ class MainWindow(QMainWindow):
                 self.catalog_category.setCurrentIndex(category_index)
             saved_market = str(firmware_state.get("catalog_market") or "")
             if saved_market:
-                self._populate_combo(self.catalog_market, [saved_market], [saved_market])
+                self._populate_combo(
+                    self.catalog_market, [saved_market], [saved_market]
+                )
             saved_model = str(firmware_state.get("catalog_model") or "")
             if saved_model:
                 self._populate_combo(self.catalog_model, [saved_model], [saved_model])
@@ -1183,7 +1208,9 @@ class MainWindow(QMainWindow):
         self.artifact_table = QTableWidget(0, len(ARTIFACT_COLUMNS))
         self.artifact_table.setHorizontalHeaderLabels(ARTIFACT_COLUMNS)
         configure_table(self.artifact_table, min_height=150)
-        self.artifact_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.artifact_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
         self.artifact_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
 
         prepare_layout.addWidget(make_form_label("Download location"), 0, 0)
@@ -1358,7 +1385,9 @@ class MainWindow(QMainWindow):
             self.logout_button.setEnabled(False)
             return
         method = str(self._current_session.get("method") or "")
-        label = "Guest session active" if method == "guest" else "Logged in with Lenovo ID"
+        label = (
+            "Guest session active" if method == "guest" else "Logged in with Lenovo ID"
+        )
         self.session_status.setText(f"{label} — {self._session_expiry_text()}")
         self.logout_button.setEnabled(True)
 
@@ -1382,7 +1411,6 @@ class MainWindow(QMainWindow):
         else:
             self._current_session = None
             self._refresh_session_ui()
-
 
     def _run_session_worker(self, worker: QThread) -> None:
         if self._session_worker is not None and self._session_worker.isRunning():
@@ -1413,7 +1441,11 @@ class MainWindow(QMainWindow):
         self._append_log("Guest login completed.")
 
     def _start_capture_login(self) -> None:
-        busy_workers = (self._command_worker, self._capture_worker, self._capture_watcher)
+        busy_workers = (
+            self._command_worker,
+            self._capture_worker,
+            self._capture_watcher,
+        )
         if any(worker is not None and worker.isRunning() for worker in busy_workers):
             QMessageBox.information(self, "LRSA", "A command is already running.")
             return
@@ -1430,7 +1462,9 @@ class MainWindow(QMainWindow):
             except FileNotFoundError:
                 pass
             except OSError as exc:
-                self._append_log(f"Could not remove stale login file {stale_file}: {exc}")
+                self._append_log(
+                    f"Could not remove stale login file {stale_file}: {exc}"
+                )
 
         base_command = [
             sys.executable,
@@ -1522,7 +1556,9 @@ class MainWindow(QMainWindow):
         self.login_button.setEnabled(True)
         session_file = (self._work_dir() / "capture" / "login_session.json").resolve()
         if returncode != 0:
-            self._append_log("Login capture failed; ignoring any older saved capture session.")
+            self._append_log(
+                "Login capture failed; ignoring any older saved capture session."
+            )
             QMessageBox.warning(
                 self,
                 "Lenovo ID login failed",
@@ -1566,7 +1602,6 @@ class MainWindow(QMainWindow):
         self._set_active_session(session, persist=True)
         self._append_log(f"Imported captured Lenovo ID session from {session_file}.")
 
-
     def _logout_active_session(self) -> None:
         if not self._current_session:
             QMessageBox.information(self, "LRSA", "No active session.")
@@ -1580,7 +1615,6 @@ class MainWindow(QMainWindow):
             self._append_log(f"logout.{item.get('step')}: {item}")
         self._set_active_session(None, persist=True)
         self._append_log("Session cleared.")
-
 
     def _refresh_devices_once(self) -> None:
         try:
@@ -1660,7 +1694,9 @@ class MainWindow(QMainWindow):
 
     def _run_catalog_worker(self, action: str, market_name: str = "") -> None:
         if self._catalog_worker is not None and self._catalog_worker.isRunning():
-            QMessageBox.information(self, "LRSA", "A catalog request is already running.")
+            QMessageBox.information(
+                self, "LRSA", "A catalog request is already running."
+            )
             return
         worker = CatalogBrowseWorker(
             session=self._current_session,
@@ -1696,9 +1732,7 @@ class MainWindow(QMainWindow):
             self._append_log(f"Loaded {len(strings)} catalog market(s).")
         else:
             self._catalog_models = strings
-            labels = (
-                ["(select model)", *strings] if strings else ["(no models found)"]
-            )
+            labels = ["(select model)", *strings] if strings else ["(no models found)"]
             data = ["", *strings] if strings else [""]
             self._populate_combo(self.catalog_model, labels, data)
             self._append_log(f"Loaded {len(strings)} catalog model(s).")
@@ -1759,7 +1793,9 @@ class MainWindow(QMainWindow):
         self.resource_table.setRowCount(len(resources))
         for row, resource in enumerate(resources):
             summary = resource_summary(resource)
-            rom_name = str(summary.get("firmwareName") or resource.get("modelName") or "")
+            rom_name = str(
+                summary.get("firmwareName") or resource.get("modelName") or ""
+            )
             self.resource_table.setItem(row, 0, QTableWidgetItem(rom_name))
         self._append_log(f"Listed {len(resources)} ROM resource(s).")
         self._append_log(f"Response saved under {self._work_dir()}.")
@@ -1820,6 +1856,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _format_progress_amount(current: int, total: int, stage: str) -> str:
         if stage == "download":
+
             def format_bytes(value: int) -> str:
                 amount = float(max(0, value))
                 for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -1965,11 +2002,13 @@ class MainWindow(QMainWindow):
     def _preview_flash_plan(self) -> None:
         if self._selected_rom_base is None:
             return
-        self._run_lrsa_command([
-            "--skip-api",
-            "--image-dir",
-            str(self._selected_rom_base),
-        ])
+        self._run_lrsa_command(
+            [
+                "--skip-api",
+                "--image-dir",
+                str(self._selected_rom_base),
+            ]
+        )
 
     def _install_rom(self) -> None:
         if self._selected_rom_base is None:
@@ -1984,20 +2023,25 @@ class MainWindow(QMainWindow):
                 "\n\nNo Qualcomm EDL device is currently detected; the backend preflight will block "
                 "flashing unless one appears."
             )
-        if QMessageBox.warning(
-            self,
-            "Install ROM",
-            message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
+        if (
+            QMessageBox.warning(
+                self,
+                "Install ROM",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
             return
-        self._run_lrsa_command([
-            "--skip-api",
-            "--image-dir",
-            str(self._selected_rom_base),
-            "--flash",
-        ])
+        self._run_lrsa_command(
+            [
+                "--skip-api",
+                "--image-dir",
+                str(self._selected_rom_base),
+                "--flash",
+            ]
+        )
 
     def _run_lrsa_command(self, args: list[str]) -> None:
         if self._command_worker is not None and self._command_worker.isRunning():

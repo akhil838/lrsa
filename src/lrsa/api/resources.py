@@ -71,6 +71,7 @@ def catalog_strings(
                 break
     return values
 
+
 def first_resource(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     resources = content_list(payload)
     return resources[0] if resources else None

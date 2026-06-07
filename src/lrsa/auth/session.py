@@ -190,7 +190,9 @@ def complete_lenovo_id_login(
     from ..api.client import LRSAClient
 
     effective_client_uuid = client_uuid or (
-        str(seed.get("client_uuid")) if isinstance(seed, dict) and seed.get("client_uuid") else None
+        str(seed.get("client_uuid"))
+        if isinstance(seed, dict) and seed.get("client_uuid")
+        else None
     )
     client = LRSAClient(client_uuid=effective_client_uuid)
 
@@ -202,11 +204,17 @@ def complete_lenovo_id_login(
     if not token and code:
         token_response = client.lenovo_id_oauth_callback(
             code,
-            scope=parsed.get("scope") or (
-                str(seed.get("scope")) if isinstance(seed, dict) and seed.get("scope") else SCOPE
+            scope=parsed.get("scope")
+            or (
+                str(seed.get("scope"))
+                if isinstance(seed, dict) and seed.get("scope")
+                else SCOPE
             ),
-            state=parsed.get("state") or (
-                str(seed.get("state")) if isinstance(seed, dict) and seed.get("state") else None
+            state=parsed.get("state")
+            or (
+                str(seed.get("state"))
+                if isinstance(seed, dict) and seed.get("state")
+                else None
             ),
         )
         callback = token_response.get("softwarefix_callback") or {}

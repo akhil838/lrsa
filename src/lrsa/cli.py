@@ -144,7 +144,6 @@ def main(argv: list[str] | None = None):
     )
     args = parser.parse_args(argv)
 
-
     token = args.token
     if args.model is not None:
         args.model = args.model.strip()

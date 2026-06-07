@@ -233,7 +233,9 @@ def _prepare_component(
     if kind == "rom":
         has_existing_extract = extracted_rom_has_flash_files(target_dir)
     else:
-        has_existing_extract = any(target_dir.iterdir()) if target_dir.exists() else False
+        has_existing_extract = (
+            any(target_dir.iterdir()) if target_dir.exists() else False
+        )
 
     if has_existing_extract:
         artifact["reusedExtract"] = True

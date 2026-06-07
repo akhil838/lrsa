@@ -790,8 +790,9 @@ def main():
         },
     )
     if args.url_file:
-        save_json(args.url_file, {"auth_url": auth_url, "login_url_mode": args.login_url_mode})
-
+        save_json(
+            args.url_file, {"auth_url": auth_url, "login_url_mode": args.login_url_mode}
+        )
 
     # Generate cert
     generate_cert()
@@ -826,7 +827,6 @@ def main():
                     "port": CAPTURE_PORT,
                 },
             )
-
 
         # Open browser or wait for the real Software Fix client to do it.
         if args.external_login:
