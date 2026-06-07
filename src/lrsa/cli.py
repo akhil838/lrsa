@@ -71,9 +71,6 @@ def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="Run LRSA login -> firmware -> QFIL workflow"
     )
-    parser.add_argument(
-        "--menu", action="store_true", help="Open the interactive menu."
-    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--sn", default=DEFAULT_SN)
     parser.add_argument(
@@ -147,15 +144,20 @@ def main(argv: list[str] | None = None):
     )
     args = parser.parse_args(argv)
 
-    if args.menu:
-        from .menu import main as menu_main
-
-        menu_main()
-        return
-
     token = args.token
+    if args.model is not None:
+        args.model = args.model.strip()
+    if args.sn is not None:
+        args.sn = args.sn.strip()
+    if args.imei is not None:
+        args.imei = args.imei.strip()
+    if args.imei2 is not None:
+        args.imei2 = args.imei2.strip()
     if args.token_file:
-        token = extract_token_from_file(args.token_file)
+        try:
+            token = extract_token_from_file(args.token_file)
+        except (OSError, ValueError) as exc:
+            parser.error(f"Could not read --token-file {args.token_file}: {exc}")
     elif args.login == "lenovoid" and not args.only_login:
         session = run_lenovoid_login(
             open_browser=not args.no_browser,
@@ -350,13 +352,13 @@ def main(argv: list[str] | None = None):
                 get_logger(__name__).info(
                     f"Fastboot recipe checks: {', '.join(fastboot_result['requiredSteps'])}"
                 )
-                if fastboot_result["checked"]:
-                    get_logger(__name__).info("Fastboot property preflight passed.")
-                elif fastboot_result.get("warning"):
+                if fastboot_result.get("warning"):
                     get_logger(__name__).warning(
                         "Fastboot property preflight warning: %s",
                         fastboot_result["warning"],
                     )
+                elif fastboot_result["checked"]:
+                    get_logger(__name__).info("Fastboot property preflight passed.")
             else:
                 get_logger(__name__).info(
                     "Fastboot recipe checks: none required by this flow."

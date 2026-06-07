@@ -32,6 +32,7 @@ import urllib.parse
 import webbrowser
 import random
 import string
+from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -375,7 +376,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
                 f"\n[-] Software Fix callback response had no Authorization: code={code} desc={desc}"
             )
 
-    def log_message(self, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
 
@@ -413,7 +414,7 @@ def resolve_upstream_hosts():
     for host in capture_hosts:
         infos = socket.getaddrinfo(host, CAPTURE_PORT, type=socket.SOCK_STREAM)
         for info in infos:
-            ip = info[4][0]
+            ip = str(info[4][0])
             if ":" not in ip:
                 resolved[host] = ip
                 break
@@ -672,6 +673,16 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument(
+        "--url-file",
+        type=Path,
+        help="Write the generated Lenovo ID login URL to this JSON file.",
+    )
+    parser.add_argument(
+        "--ready-file",
+        type=Path,
+        help="Write a JSON marker after the local HTTPS callback listener is ready.",
+    )
+    parser.add_argument(
         "--external-login",
         action="store_true",
         help="Only start the lsa.lenovo.com callback listener; initiate login from the real Software Fix client.",
@@ -778,6 +789,10 @@ def main():
             "login_seed": login_seed,
         },
     )
+    if args.url_file:
+        save_json(
+            args.url_file, {"auth_url": auth_url, "login_url_mode": args.login_url_mode}
+        )
 
     # Generate cert
     generate_cert()
@@ -803,6 +818,15 @@ def main():
         server.socket = context.wrap_socket(server.socket, server_side=True)
         server.timeout = 1
         get_logger(__name__).info("[+] HTTPS server running on :%s", CAPTURE_PORT)
+        if args.ready_file:
+            save_json(
+                args.ready_file,
+                {
+                    "auth_url": auth_url,
+                    "hosts": list(capture_hosts),
+                    "port": CAPTURE_PORT,
+                },
+            )
 
         # Open browser or wait for the real Software Fix client to do it.
         if args.external_login:

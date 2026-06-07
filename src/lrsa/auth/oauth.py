@@ -42,6 +42,8 @@ from .constants import (
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+REQUEST_TIMEOUT = 30
+
 
 def generate_pkce():
     """Generate PKCE code_verifier and code_challenge."""
@@ -84,11 +86,17 @@ def exchange_code_for_token(code, code_verifier):
         "code_verifier": code_verifier,
     }
 
-    r = requests.post(TOKEN_ENDPOINT, data=data, verify=False)
-    get_logger(__name__).info(f"    Status: {r.status_code}")
-    get_logger(__name__).info(f"    Response: {r.text[:500]}")
+    try:
+        r = requests.post(
+            TOKEN_ENDPOINT, data=data, verify=False, timeout=REQUEST_TIMEOUT
+        )
+    except requests.RequestException as exc:
+        get_logger(__name__).warning("    Token request failed: %s", exc)
+        r = None
+    if r is not None:
+        get_logger(__name__).info(f"    Status: {r.status_code}")
 
-    if r.status_code == 200:
+    if r is not None and r.status_code == 200:
         try:
             token_data = r.json()
             if "access_token" in token_data:
@@ -96,20 +104,29 @@ def exchange_code_for_token(code, code_verifier):
             # Some OAuth servers return token differently
             if "id_token" in token_data:
                 return token_data
-        except Exception:
-            pass
+        except ValueError as exc:
+            get_logger(__name__).warning(
+                "    Token response was not valid JSON: %s", exc
+            )
 
     # Try with JSON content type
     get_logger(__name__).info("\n[*] Retry with JSON content type...")
-    r = requests.post(TOKEN_ENDPOINT, json=data, verify=False)
+    try:
+        r = requests.post(
+            TOKEN_ENDPOINT, json=data, verify=False, timeout=REQUEST_TIMEOUT
+        )
+    except requests.RequestException as exc:
+        get_logger(__name__).warning("    JSON token request failed: %s", exc)
+        return None
     get_logger(__name__).info(f"    Status: {r.status_code}")
-    get_logger(__name__).info(f"    Response: {r.text[:500]}")
 
     if r.status_code == 200:
         try:
             return r.json()
-        except Exception:
-            pass
+        except ValueError as exc:
+            get_logger(__name__).warning(
+                "    JSON token response was not valid JSON: %s", exc
+            )
 
     return None
 
@@ -140,9 +157,17 @@ def test_firmware_api(token):
     ]
 
     for path, body in endpoints:
-        r = requests.post(
-            f"{INTERFACE_URL}{path}", headers=headers, json=body, verify=False
-        )
+        try:
+            r = requests.post(
+                f"{INTERFACE_URL}{path}",
+                headers=headers,
+                json=body,
+                verify=False,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            get_logger(__name__).info(f"  [?] {path}: request failed: {exc}")
+            continue
         try:
             data = r.json()
             status_icon = "+" if data.get("code") == "0000" else "-"
@@ -153,7 +178,7 @@ def test_firmware_api(token):
                 get_logger(__name__).info(f"\n[+] SUCCESS on {path}!")
                 get_logger(__name__).info(json.dumps(data, indent=2))
                 return data
-        except Exception:
+        except ValueError:
             get_logger(__name__).info(f"  [?] {path}: {r.status_code} {r.text[:100]}")
 
     return None

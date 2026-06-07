@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
-from lrsa.logging import get_logger
-
 import json
 import shutil
 from pathlib import Path
 from typing import Any, Callable, cast
+
 
 from ..api.firmware import download_file, download_json, extract_archive, verify_md5
 from .constants import MOBILE_TABLET_CATEGORIES, QUALCOMM_PLATFORMS
 from .rom_decrypt import decrypt_rom_files
 
 ProgressCallback = Callable[[str, int, int | None, str], None]
+
+RESOURCE_KINDS = (
+    ("rom", "romResource", "rom"),
+    ("tool", "toolResource", "tool"),
+    ("countryCode", "countryCodeResource", "country_code"),
+)
 
 
 def dict_value(value: object) -> dict[str, Any]:
@@ -33,8 +38,13 @@ def is_qualcomm(resource: dict[str, Any]) -> bool:
 
 
 def load_flow(path: Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read flow JSON at {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse flow JSON at {path}: {exc}") from exc
 
 
 def flow_shell_steps(flow: dict[str, Any]) -> list[dict[str, Any]]:
@@ -120,22 +130,150 @@ def extracted_rom_has_flash_files(path: Path) -> bool:
     return any(path.rglob("rawprogram*.xml")) and any(path.rglob("patch*.xml"))
 
 
+def _artifact_target_dir(work_dir: Path, relative_dir: str) -> Path:
+    return work_dir / "software_fix" / relative_dir
+
+
+def _resource_components(resource: dict[str, Any]) -> list[dict[str, Any]]:
+    components: list[dict[str, Any]] = []
+    for kind, field, relative_dir in RESOURCE_KINDS:
+        info = dict_value(resource.get(field))
+        if not info:
+            continue
+        components.append(
+            {
+                "kind": kind,
+                "field": field,
+                "relativeDir": relative_dir,
+                "info": info,
+            }
+        )
+    return components
+
+
+def _artifact_status(
+    *,
+    kind: str,
+    relative_dir: str,
+    info: dict[str, Any],
+    work_dir: Path,
+) -> dict[str, Any]:
+    artifact = {
+        "kind": kind,
+        "name": info.get("name"),
+        "type": info.get("type"),
+        "url": info.get("uri"),
+        "unZip": bool(info.get("unZip")),
+        "md5": info.get("md5"),
+        "relativeDir": relative_dir,
+    }
+    target_dir = _artifact_target_dir(work_dir, relative_dir)
+    artifact["targetDir"] = str(target_dir.resolve())
+    return artifact
+
+
+def _prepare_component(
+    *,
+    kind: str,
+    relative_dir: str,
+    info: dict[str, Any],
+    work_dir: Path,
+    downloads_dir: Path,
+    download_resources: bool,
+    extract_resources: bool,
+    decrypt_rom: bool,
+    decrypt_file_types: str | None,
+    progress_callback: ProgressCallback | None,
+) -> dict[str, Any]:
+    artifact = _artifact_status(
+        kind=kind,
+        relative_dir=relative_dir,
+        info=info,
+        work_dir=work_dir,
+    )
+    target_dir = _artifact_target_dir(work_dir, relative_dir)
+    expected_archive = find_existing_archive(downloads_dir, info)
+    if expected_archive:
+        artifact["archive"] = str(expected_archive)
+        artifact["archiveMd5"] = verify_md5(expected_archive, info.get("md5"))
+        artifact["downloaded"] = True
+        artifact["reusedDownload"] = True
+        if artifact["archiveMd5"]["verified"] is False:
+            raise RuntimeError(
+                f"{kind} MD5 mismatch for {expected_archive}: expected {artifact['archiveMd5']['expected']}, got {artifact['archiveMd5']['actual']}"
+            )
+    else:
+        artifact["downloaded"] = False
+        artifact["reusedDownload"] = False
+
+    if download_resources and info.get("uri"):
+        archive = download_file(
+            str(info["uri"]),
+            downloads_dir,
+            progress_callback=progress_callback,
+        )
+        artifact["archive"] = str(archive)
+        artifact["archiveMd5"] = verify_md5(archive, info.get("md5"))
+        artifact["downloaded"] = True
+        artifact["reusedDownload"] = False
+        if artifact["archiveMd5"]["verified"] is False:
+            raise RuntimeError(
+                f"{kind} MD5 mismatch for {archive}: expected {artifact['archiveMd5']['expected']}, got {artifact['archiveMd5']['actual']}"
+            )
+
+    archive_path = artifact.get("archive")
+    if not archive_path:
+        return artifact
+
+    if not extract_resources or not info.get("unZip"):
+        return artifact
+
+    archive = Path(str(archive_path))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if kind == "rom":
+        has_existing_extract = extracted_rom_has_flash_files(target_dir)
+    else:
+        has_existing_extract = (
+            any(target_dir.iterdir()) if target_dir.exists() else False
+        )
+
+    if has_existing_extract:
+        artifact["reusedExtract"] = True
+    else:
+        extract_archive(archive, target_dir, progress_callback=progress_callback)
+        artifact["reusedExtract"] = False
+
+    artifact["extractedDir"] = str(target_dir.resolve())
+    artifact["extracted"] = True
+
+    if kind == "rom" and decrypt_rom and decrypt_file_types:
+        if progress_callback:
+            progress_callback("decrypt", 0, None, "Decrypting ROM files")
+        decrypted = decrypt_rom_files(target_dir, decrypt_file_types)
+        if progress_callback:
+            progress_callback("decrypt", 1, 1, "ROM decrypt complete")
+        if decrypted:
+            artifact["decryptedFiles"] = [str(path.resolve()) for path in decrypted]
+
+    return artifact
+
+
 def prepare_artifacts(
     resource: dict[str, Any],
     work_dir: Path,
     download_rom: bool = False,
     extract_rom: bool = False,
     decrypt_rom: bool = True,
+    downloads_dir: Path | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Download/extract the same artifacts Software Fix references.
-
-    This prepares the package; it intentionally does not invent a missing
-    Rescue.cmd. Execution should follow the downloaded flashFlow metadata.
-    """
+    """Download/extract the same artifacts Software Fix references."""
     work_dir = Path(work_dir)
-    downloads_dir = work_dir / "software_fix" / "downloads"
-    rom_dir = work_dir / "software_fix" / "rom"
+    downloads_dir = (
+        Path(downloads_dir)
+        if downloads_dir is not None
+        else work_dir / "software_fix" / "downloads"
+    )
     flow_path = work_dir / "software_fix" / "flash_flow.json"
 
     rom = dict_value(resource.get("romResource"))
@@ -147,6 +285,8 @@ def prepare_artifacts(
         "romName": rom.get("name"),
         "romUrl": rom.get("uri"),
         "flashFlowUrl": resource.get("flashFlow"),
+        "downloadsDir": str(downloads_dir.resolve()),
+        "resourceArtifacts": [],
     }
 
     if resource.get("flashFlow"):
@@ -164,76 +304,47 @@ def prepare_artifacts(
         flow = {}
         decrypt_file_types = None
 
-    existing_rom_archive = find_existing_archive(downloads_dir, rom)
-    if existing_rom_archive:
-        result["romArchive"] = str(existing_rom_archive)
-        rom_md5 = verify_md5(existing_rom_archive, rom.get("md5"))
-        result["romMd5"] = rom_md5
-        if rom_md5["verified"] is False:
-            raise RuntimeError(
-                f"ROM MD5 mismatch for {existing_rom_archive}: expected {rom_md5['expected']}, got {rom_md5['actual']}"
-            )
-
-    if download_rom and rom.get("uri"):
-        rom_archive = download_file(
-            rom["uri"], downloads_dir, progress_callback=progress_callback
+    for component in _resource_components(resource):
+        artifact = _prepare_component(
+            kind=str(component["kind"]),
+            relative_dir=str(component["relativeDir"]),
+            info=cast(dict[str, Any], component["info"]),
+            work_dir=work_dir,
+            downloads_dir=downloads_dir,
+            download_resources=download_rom,
+            extract_resources=extract_rom,
+            decrypt_rom=decrypt_rom,
+            decrypt_file_types=decrypt_file_types,
+            progress_callback=progress_callback,
         )
-        result["romArchive"] = str(rom_archive)
-        rom_md5 = verify_md5(rom_archive, rom.get("md5"))
-        result["romMd5"] = rom_md5
-        if rom_md5["verified"] is False:
-            raise RuntimeError(
-                f"ROM MD5 mismatch for {rom_archive}: expected {rom_md5['expected']}, got {rom_md5['actual']}"
-            )
-        if extract_rom:
-            decrypted = []
-            if extracted_rom_has_flash_files(rom_dir):
-                get_logger(__name__).info("Using existing extracted ROM: %s", rom_dir)
-                if progress_callback:
-                    progress_callback("extract", 1, 1, "Using existing extracted ROM")
-            else:
-                extract_archive(
-                    rom_archive, rom_dir, progress_callback=progress_callback
-                )
-            result["romDir"] = str(rom_dir.resolve())
-            if decrypt_rom and decrypt_file_types:
-                if progress_callback:
-                    progress_callback("decrypt", 0, None, "Decrypting ROM files")
-                decrypted = decrypt_rom_files(rom_dir, decrypt_file_types)
-                if progress_callback:
-                    progress_callback("decrypt", 1, 1, "ROM decrypt complete")
-            if decrypted:
-                result["decryptedFiles"] = [str(path.resolve()) for path in decrypted]
-    elif extract_rom and existing_rom_archive:
-        if extracted_rom_has_flash_files(rom_dir):
-            get_logger(__name__).info("Using existing extracted ROM: %s", rom_dir)
-            if progress_callback:
-                progress_callback("extract", 1, 1, "Using existing extracted ROM")
-        else:
-            extract_archive(
-                existing_rom_archive,
-                rom_dir,
-                progress_callback=progress_callback,
-            )
-        result["romDir"] = str(rom_dir.resolve())
-        if decrypt_rom and decrypt_file_types:
-            if progress_callback:
-                progress_callback("decrypt", 0, None, "Decrypting ROM files")
-            decrypted = decrypt_rom_files(rom_dir, decrypt_file_types)
-            if progress_callback:
-                progress_callback("decrypt", 1, 1, "ROM decrypt complete")
-            if decrypted:
-                result["decryptedFiles"] = [str(path.resolve()) for path in decrypted]
-    elif extract_rom and not existing_rom_archive:
-        raise RuntimeError(
-            "ROM archive is not downloaded yet. Run Download ROM before Extract ROM."
-        )
-    elif extracted_rom_has_flash_files(rom_dir):
-        result["romDir"] = str(rom_dir.resolve())
-        if decrypt_rom and decrypt_file_types:
-            decrypted = decrypt_rom_files(rom_dir, decrypt_file_types)
-            if decrypted:
-                result["decryptedFiles"] = [str(path.resolve()) for path in decrypted]
+        result["resourceArtifacts"].append(artifact)
+        kind = artifact["kind"]
+        archive = artifact.get("archive")
+        extracted_dir = artifact.get("extractedDir")
+        md5_status = artifact.get("archiveMd5")
+        if kind == "rom":
+            if archive:
+                result["romArchive"] = archive
+            if md5_status:
+                result["romMd5"] = md5_status
+            if extracted_dir:
+                result["romDir"] = extracted_dir
+            if artifact.get("decryptedFiles"):
+                result["decryptedFiles"] = artifact["decryptedFiles"]
+        elif kind == "tool":
+            if archive:
+                result["toolArchive"] = archive
+            if md5_status:
+                result["toolMd5"] = md5_status
+            if extracted_dir:
+                result["toolDir"] = extracted_dir
+        elif kind == "countryCode":
+            if archive:
+                result["countryCodeArchive"] = archive
+            if md5_status:
+                result["countryCodeMd5"] = md5_status
+            if extracted_dir:
+                result["countryCodeDir"] = extracted_dir
 
     startup = find_startup_file(work_dir / "software_fix", flow) if flow else None
     if startup:

@@ -21,6 +21,57 @@ def content_list(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
     return [item for item in content if isinstance(item, dict)]
 
 
+def _text_value(value: object) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
+
+
+def _catalog_items(content: object) -> list[object]:
+    if isinstance(content, dict):
+        models = content.get("models")
+        if isinstance(models, list):
+            return models
+        return list(content.values())
+    if isinstance(content, list):
+        items: list[object] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("marketNames"), list):
+                items.extend(item["marketNames"])
+            else:
+                items.append(item)
+        return items
+    return []
+
+
+def catalog_strings(
+    payload: dict[str, Any] | None, preferred_keys: tuple[str, ...] = ()
+) -> list[str]:
+    if not payload:
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in _catalog_items(payload.get("content")):
+        candidates: list[str | None] = []
+        if isinstance(item, dict):
+            for key in preferred_keys:
+                candidates.append(_text_value(item.get(key)))
+            if not preferred_keys:
+                for value in item.values():
+                    candidates.append(_text_value(value))
+        else:
+            candidates.append(_text_value(item))
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                values.append(candidate)
+                break
+    return values
+
+
 def first_resource(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     resources = content_list(payload)
     return resources[0] if resources else None
@@ -44,15 +95,13 @@ def resource_at(
 def resource_summary(resource: dict[str, Any] | None) -> dict[str, Any]:
     if not resource:
         return {}
-    rom = (
-        resource.get("romResource")
-        if isinstance(resource.get("romResource"), dict)
-        else {}
-    )
-    tool = (
-        resource.get("toolResource")
-        if isinstance(resource.get("toolResource"), dict)
-        else {}
+    rom_resource = resource.get("romResource")
+    rom: dict[str, Any] = rom_resource if isinstance(rom_resource, dict) else {}
+    tool_resource = resource.get("toolResource")
+    tool: dict[str, Any] = tool_resource if isinstance(tool_resource, dict) else {}
+    country_resource = resource.get("countryCodeResource")
+    country: dict[str, Any] = (
+        country_resource if isinstance(country_resource, dict) else {}
     )
     return {
         "brand": resource.get("brand"),
@@ -67,5 +116,7 @@ def resource_summary(resource: dict[str, Any] | None) -> dict[str, Any]:
         "firmwareMd5": rom.get("md5"),
         "toolName": tool.get("name"),
         "toolUrl": tool.get("uri"),
+        "countryCodeName": country.get("name"),
+        "countryCodeUrl": country.get("uri"),
         "flashFlow": resource.get("flashFlow"),
     }
