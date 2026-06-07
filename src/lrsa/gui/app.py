@@ -2083,18 +2083,20 @@ class MainWindow(QMainWindow):
         return None
 
     def _preview_flash_plan(self) -> None:
-        if self._selected_rom_base is None:
+        if self._selected_rom_base is None or self._selected_startup is None:
             return
         self._run_lrsa_command(
             [
                 "--skip-api",
                 "--image-dir",
                 str(self._selected_rom_base),
+                "--startup-file",
+                str(self._selected_startup),
             ]
         )
 
     def _install_rom(self) -> None:
-        if self._selected_rom_base is None:
+        if self._selected_rom_base is None or self._selected_startup is None:
             return
         has_edl = any(
             str(device.get("transport", "")).lower() == "edl"
@@ -2122,6 +2124,8 @@ class MainWindow(QMainWindow):
                 "--skip-api",
                 "--image-dir",
                 str(self._selected_rom_base),
+                "--startup-file",
+                str(self._selected_startup),
                 "--flash",
             ]
         )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import shutil
+import time
 from pathlib import Path
 
 from lrsa.logging import get_logger
@@ -30,6 +31,59 @@ def find_qualcomm_edl_devices() -> list[dict[str, str]]:
                 }
             )
     return devices
+
+
+def reboot_fastboot_to_edl(
+    fastboot: str | Path = "fastboot",
+    timeout: int = 45,
+) -> list[dict[str, str]]:
+    fastboot_devices = scan_fastboot_devices()
+    if not fastboot_devices:
+        return []
+    serial = fastboot_devices[0]["serial"]
+    commands = [
+        [str(fastboot), "-s", serial, "reboot", "edl"],
+        [str(fastboot), "-s", serial, "oem", "edl"],
+    ]
+    last_detail = ""
+    for command in commands:
+        get_logger(__name__).info(
+            "Requesting EDL from fastboot: %s", command_text(command)
+        )
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        last_detail = format_process_output(proc.stdout, proc.stderr)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            devices = find_qualcomm_edl_devices()
+            if devices:
+                return devices
+            time.sleep(0.5)
+        if proc.returncode == 0:
+            break
+    raise RuntimeError(
+        "Fastboot device did not appear as Qualcomm 9008/QDLoader after EDL reboot request.\n"
+        + last_detail
+    )
+
+
+def ensure_qualcomm_edl_device(
+    *,
+    allow_fastboot_reboot: bool = True,
+) -> list[dict[str, str]]:
+    devices = find_qualcomm_edl_devices()
+    if devices:
+        return devices
+    if allow_fastboot_reboot and scan_fastboot_devices():
+        return reboot_fastboot_to_edl()
+    raise RuntimeError(
+        "No Qualcomm 9008/QDLoader USB device found. Put the device in EDL mode before flash/readback."
+    )
 
 
 def require_qualcomm_edl_device() -> list[dict[str, str]]:
