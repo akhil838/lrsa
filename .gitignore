@@ -27,6 +27,8 @@ callback_response.json
 login_session.json
 *.har
 *.zip
+*.part
+downloads/
 *.dmg
 *.apk
 *.exe

@@ -59,9 +59,10 @@ def analyze_dll(filepath):
         "strings": [],
     }
 
-    # Get type definitions
-    if hasattr(dn.net, "mdtables") and dn.net.mdtables:
-        td = getattr(dn.net.mdtables, "TypeDef", None)
+    net = getattr(dn, "net", None)
+    mdtables = getattr(net, "mdtables", None)
+    if mdtables:
+        td = getattr(mdtables, "TypeDef", None)
         if td:
             for row in td.rows:
                 name = str(row.TypeName) if row.TypeName else ""
@@ -69,7 +70,7 @@ def analyze_dll(filepath):
                 if name and not name.startswith("<"):
                     info["types"].append(f"{ns}.{name}" if ns else name)
 
-        md = getattr(dn.net.mdtables, "MethodDef", None)
+        md = getattr(mdtables, "MethodDef", None)
         if md:
             for row in md.rows:
                 name = str(row.Name) if row.Name else ""
@@ -77,7 +78,7 @@ def analyze_dll(filepath):
                     info["methods"].append(name)
 
         # Get MemberRef for external method calls
-        mr = getattr(dn.net.mdtables, "MemberRef", None)
+        mr = getattr(mdtables, "MemberRef", None)
         if mr:
             for row in mr.rows:
                 name = str(row.Name) if row.Name else ""

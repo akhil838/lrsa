@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""Login entrypoint for LRSA.
+"""Login entrypoint for LRSA."""
 
-Examples:
-  python3 -m lrsa.auth.login --method guest
-  python3 -m lrsa.auth.login --method lenovoid
-  python3 -m lrsa.auth.login --method lenovoid --no-browser
-"""
-
-from lrsa.logging import get_logger
+from __future__ import annotations
 
 import argparse
 
+from lrsa.logging import get_logger
+
 from ..api.client import LRSAClient
 from ..config import DEFAULT_WORK_DIR
-from .session import lenovo_id_login, save_json
+from .session import complete_lenovo_id_login, save_json, begin_lenovo_id_login
 
 
 def guest_login(client_uuid=None, account_id=None, include_init_token=False):
@@ -30,22 +26,29 @@ def guest_login(client_uuid=None, account_id=None, include_init_token=False):
         "account_id": account_id or client.client_uuid,
         "token": client.token,
         "results": results,
+        "auto_login": False,
     }
 
 
 def lenovoid_login(open_browser=True, client_uuid=None, token=None):
-    token_data = None
-    if not token:
-        token, token_data = lenovo_id_login(open_browser=open_browser)
-    client = LRSAClient(client_uuid=client_uuid, token=token)
-    user_info = client.lenovo_id_user_info()
-    return {
-        "method": "lenovoid",
-        "client_uuid": client.client_uuid,
-        "token": token,
-        "token_response": token_data,
-        "user_info": user_info,
-    }
+    if token:
+        client = LRSAClient(client_uuid=client_uuid, token=token)
+        user_info = client.lenovo_id_user_info()
+        return {
+            "method": "lenovoid",
+            "client_uuid": client.client_uuid,
+            "token": token,
+            "token_response": None,
+            "user_info": user_info,
+            "auto_login": True,
+        }
+
+    seed = begin_lenovo_id_login(client_uuid=client_uuid, open_browser=open_browser)
+    get_logger(__name__).info("\nPaste the final callback URL from the browser.")
+    callback_url = input("Callback URL: ").strip()
+    session = complete_lenovo_id_login(callback_url, seed=seed)
+    session.setdefault("auto_login", True)
+    return session
 
 
 def main():

@@ -18,10 +18,9 @@ dependencies = [
   "docopt>=0.6.2",
   "lxml>=4.6.1",
   "colorama>=0.4.6",
-  "prompt_toolkit>=3.0.0",
+  "PySide6>=6.10",
   "tqdm>=4.66",
   "qfil @ git+https://github.com/akhil838/qfil.git",
-  "textual>=8.2.7",
 ]
 
 [dependency-groups]
@@ -32,7 +31,8 @@ dev = [
 
 [project.scripts]
 lrsa = "lrsa.cli:main"
-lrsa-menu = "lrsa.menu:main"
+lrsa-gui = "lrsa.gui:main"
+lrsa-capture-login = "lrsa.servers.capture:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -40,3 +40,7 @@ include = ["lrsa*"]
 
 [tool.uv]
 package = true
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"

@@ -5,6 +5,7 @@ from lrsa.logging import get_logger
 
 import ssl
 import sys
+from typing import Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import urllib3
@@ -90,7 +91,7 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._relay("POST")
 
-    def log_message(self, *args):
+    def log_message(self, format: str, *args: Any) -> None:
         pass
 
 

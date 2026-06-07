@@ -24,6 +24,8 @@ from ..core import LRSACrypto
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+REQUEST_TIMEOUT = 30
+
 
 class LRSAClient:
     def __init__(
@@ -100,8 +102,8 @@ class LRSAClient:
                 pass
             try:
                 result["decrypted"] = crypto.decrypt(response.text.strip())
-            except Exception:
-                pass
+            except Exception as exc:
+                get_logger(__name__).debug("Failed to decrypt LRSA response: %s", exc)
 
         return result
 
@@ -115,12 +117,20 @@ class LRSAClient:
             payload = self.crypto.encrypt(json.dumps(body, separators=(",", ":")))
             headers["Content-Type"] = "application/octet-stream"
             r = self.session.post(
-                url, data=payload, headers=headers, allow_redirects=False
+                url,
+                data=payload,
+                headers=headers,
+                allow_redirects=False,
+                timeout=REQUEST_TIMEOUT,
             )
         else:
             payload = None if body is None else json.dumps(body, separators=(",", ":"))
             r = self.session.post(
-                url, data=payload, headers=headers, allow_redirects=False
+                url,
+                data=payload,
+                headers=headers,
+                allow_redirects=False,
+                timeout=REQUEST_TIMEOUT,
             )
 
         result = self._decode_response(r, self.crypto)
@@ -134,6 +144,7 @@ class LRSAClient:
             headers=self._auth_headers(author),
             params=params,
             allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
         )
         result = self._decode_response(r, self.crypto)
         self._maybe_store_token(result)
@@ -173,8 +184,10 @@ class LRSAClient:
                     return token
         elif isinstance(value, str):
             stripped = value.strip()
-            if stripped.startswith("eyJ") or stripped.count(".") == 2:
-                return stripped.removeprefix("Bearer ").strip()
+            token = stripped.removeprefix("Bearer ").strip()
+            parts = token.split(".")
+            if len(parts) == 3 and parts[0].startswith("eyJ"):
+                return token
             try:
                 return self._find_token(json.loads(stripped))
             except ValueError:
@@ -194,15 +207,16 @@ class LRSAClient:
         )
 
     def guest_login(self, account_id=None):
-        """Log in as guest using the same payload shape as Software Fix.
+        """Log in as guest using the original Software Fix payload.
 
-        The .NET GuestLogin handler sends only {"accountId": UserData}; the
-        client UUID is carried separately in the request headers.
+        GuestLogin.Login() sets UserSource="guest", then forwards only
+        {"accountId": UserData} to /user/guestLogin.jhtml with auth headers.
         """
+        account = account_id or self.client_uuid
         return self._post(
             endpoints.GUEST_LOGIN,
             {
-                "accountId": account_id or self.client_uuid,
+                "accountId": account,
             },
         )
 
@@ -234,6 +248,22 @@ class LRSAClient:
         if token:
             self.token = token
         result["softwarefix_callback"] = callback
+        return result
+
+    def user_logout(self):
+        result = self._post(endpoints.USER_LOGOUT, wrap=False)
+        self.token = None
+        return result
+
+    def dispose_token(self):
+        result = self._post(
+            endpoints.DISPOSE_TOKEN,
+            {
+                "clientVersion": CLIENT_VERSION,
+                "clientUuid": self.client_uuid,
+            },
+        )
+        self.token = None
         return result
 
     @staticmethod
@@ -297,6 +327,9 @@ class LRSAClient:
                 "marketName": market_name,
             },
         )
+
+    def get_smart_market_names(self):
+        return self._post(endpoints.RESCUE_SMART_MARKET_NAMES, {})
 
     def get_rom_match_params(self, model_name):
         return self._post(

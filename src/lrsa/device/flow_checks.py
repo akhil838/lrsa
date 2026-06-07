@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import FASTBOOT_CHECK_STEPS
-from .preflight import run_fastboot_getvar_all
+from .preflight import run_fastboot_getvar_all_with_warning
 
 
 def flow_step_names(flow: dict[str, Any]) -> list[str]:
@@ -49,9 +49,11 @@ def validate_fastboot_recipe_checks(
         )
         return result
 
-    props = run_fastboot_getvar_all(fastboot_path)
+    props, warning = run_fastboot_getvar_all_with_warning(fastboot_path)
     result["checked"] = True
     result["properties"] = props
+    if warning:
+        result["warning"] = warning
 
     expected = (
         str(resource.get("realModelName") or resource.get("modelName") or "")

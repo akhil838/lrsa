@@ -44,6 +44,12 @@ def require_qualcomm_edl_device() -> list[dict[str, str]]:
 def run_fastboot_getvar_all(
     fastboot: str | Path = "fastboot", timeout: int = 20
 ) -> dict[str, str]:
+    return run_fastboot_getvar_all_with_warning(fastboot, timeout)[0]
+
+
+def run_fastboot_getvar_all_with_warning(
+    fastboot: str | Path = "fastboot", timeout: int = 20
+) -> tuple[dict[str, str], str | None]:
     command = [str(fastboot), "getvar", "all"]
     get_logger(__name__).info("Running fastboot preflight: %s", command_text(command))
     proc = subprocess.run(
@@ -63,15 +69,15 @@ def run_fastboot_getvar_all(
             continue
         key, value = line.split(":", 1)
         props[key.strip().lower()] = value.strip()
+    warning = None
     if proc.returncode != 0:
         detail = format_process_output(proc.stdout, proc.stderr)
         if props:
-            get_logger(__name__).warning(
-                "fastboot getvar all returned exit code %s but %s properties were parsed.\n%s",
-                proc.returncode,
-                len(props),
-                detail,
+            warning = (
+                f"fastboot getvar all returned exit code {proc.returncode} "
+                f"but {len(props)} properties were parsed.\n{detail}"
             )
+            get_logger(__name__).warning(warning)
         else:
             raise RuntimeError(
                 f"fastboot getvar all failed with exit code {proc.returncode}: "
@@ -81,7 +87,7 @@ def run_fastboot_getvar_all(
         get_logger(__name__).debug(
             "fastboot getvar all parsed %s properties", len(props)
         )
-    return props
+    return props, warning
 
 
 def format_usb_devices(devices: list[dict[str, str]]) -> str:
@@ -169,7 +175,7 @@ def scan_fastboot_devices() -> list[dict[str, str]]:
         state = parts[1] if len(parts) > 1 else "fastboot"
         detail_parts = []
         for key in ("product", "current-slot", "unlocked"):
-            value = fastboot_getvar(key, serial if len(lines) == 1 else None)
+            value = fastboot_getvar(key, serial)
             if value:
                 detail_parts.append(f"{key}={value}")
         devices.append(

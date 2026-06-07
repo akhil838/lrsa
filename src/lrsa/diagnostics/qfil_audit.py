@@ -137,39 +137,47 @@ def pe_metadata(path: Path) -> dict[str, Any] | None:
         return {"parse_error": str(exc)}
 
     imports: dict[str, list[str]] = {}
-    if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
-        for entry in pe.DIRECTORY_ENTRY_IMPORT:
-            dll = entry.dll.decode("utf-8", errors="ignore")
-            imports[dll] = unique_sorted(
-                [
-                    imp.name.decode("utf-8", errors="ignore")
-                    if imp.name
-                    else f"ordinal_{imp.ordinal}"
-                    for imp in entry.imports
-                ],
-                250,
-            )
+    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or []:
+        dll = entry.dll.decode("utf-8", errors="ignore")
+        imports[dll] = unique_sorted(
+            [
+                imp.name.decode("utf-8", errors="ignore")
+                if imp.name
+                else f"ordinal_{imp.ordinal}"
+                for imp in entry.imports
+            ],
+            250,
+        )
 
     exports: list[str] = []
-    if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+    directory_export = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+    if directory_export is not None:
         exports = unique_sorted(
             [
                 symbol.name.decode("utf-8", errors="ignore")
                 if symbol.name
                 else f"ordinal_{symbol.ordinal}"
-                for symbol in pe.DIRECTORY_ENTRY_EXPORT.symbols
+                for symbol in directory_export.symbols
             ],
             500,
         )
 
-    com_descriptor = pe.OPTIONAL_HEADER.DATA_DIRECTORY[
-        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
+    file_header = getattr(pe, "FILE_HEADER", None)
+    optional_header = getattr(pe, "OPTIONAL_HEADER", None)
+    data_directories = getattr(optional_header, "DATA_DIRECTORY", [])
+    com_descriptor_index = pefile.DIRECTORY_ENTRY[
+        "IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"
     ]
+    com_descriptor = (
+        data_directories[com_descriptor_index]
+        if len(data_directories) > com_descriptor_index
+        else None
+    )
     return {
-        "machine": hex(pe.FILE_HEADER.Machine),
-        "subsystem": pe.OPTIONAL_HEADER.Subsystem,
-        "entry_point": hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
-        "image_base": hex(pe.OPTIONAL_HEADER.ImageBase),
+        "machine": hex(getattr(file_header, "Machine", 0)),
+        "subsystem": getattr(optional_header, "Subsystem", None),
+        "entry_point": hex(getattr(optional_header, "AddressOfEntryPoint", 0)),
+        "image_base": hex(getattr(optional_header, "ImageBase", 0)),
         "imports": imports,
         "exports": exports,
         "sections": [
@@ -181,7 +189,10 @@ def pe_metadata(path: Path) -> dict[str, Any] | None:
             }
             for section in pe.sections
         ],
-        "is_dotnet": bool(com_descriptor.VirtualAddress and com_descriptor.Size),
+        "is_dotnet": bool(
+            getattr(com_descriptor, "VirtualAddress", 0)
+            and getattr(com_descriptor, "Size", 0)
+        ),
     }
 
 
