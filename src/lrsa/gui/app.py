@@ -78,6 +78,7 @@ SIDEBAR_WIDTH = 238
 FORM_LABEL_WIDTH = 112
 MIN_TABLE_HEIGHT = 180
 LAYOUT_STATE_VERSION = 2
+PROGRESS_RATE_MIN_SECONDS = 0.25
 
 
 ROM_FILE_FILTER = (
@@ -100,11 +101,18 @@ QLabel#AppTitle {
     font-weight: 800;
     letter-spacing: 0.4px;
 }
-QLabel#AppSubtitle, QLabel#FormLabel {
+QLabel#AppSubtitle, QLabel#FormLabel, QLabel#ProgressStats {
     color: #6b7280;
 }
 QLabel#FormLabel {
     font-weight: 600;
+}
+QLabel#ProgressName {
+    color: #111827;
+    font-weight: 700;
+}
+QLabel#ProgressStats {
+    font-size: 12px;
 }
 QGroupBox {
     background: #ffffff;
@@ -187,11 +195,18 @@ QLabel#AppTitle {
     font-weight: 800;
     letter-spacing: 0.4px;
 }
-QLabel#AppSubtitle, QLabel#FormLabel {
+QLabel#AppSubtitle, QLabel#FormLabel, QLabel#ProgressStats {
     color: #94a3b8;
 }
 QLabel#FormLabel {
     font-weight: 600;
+}
+QLabel#ProgressName {
+    color: #f8fafc;
+    font-weight: 700;
+}
+QLabel#ProgressStats {
+    font-size: 12px;
 }
 QGroupBox {
     background: #111827;
@@ -762,6 +777,9 @@ class MainWindow(QMainWindow):
         self._capture_worker: CaptureLoginWorker | None = None
         self._capture_watcher: LoginSessionWatcher | None = None
         self._capture_started_at = 0.0
+        self._progress_key: tuple[str, str] | None = None
+        self._progress_started_at = 0.0
+        self._progress_started_current = 0
         self._catalog_markets: list[str] = []
         self._catalog_models: list[str] = []
         self.work_dir_input = QLineEdit(
@@ -1204,7 +1222,19 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
+        self.progress_name_label = QLabel("No active download")
+        self.progress_name_label.setObjectName("ProgressName")
+        self.progress_name_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.progress_name_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         self.progress_label = QLabel("Idle")
+        self.progress_label.setObjectName("ProgressStats")
+        self.progress_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.artifact_table = QTableWidget(0, len(ARTIFACT_COLUMNS))
         self.artifact_table.setHorizontalHeaderLabels(ARTIFACT_COLUMNS)
         configure_table(self.artifact_table, min_height=150)
@@ -1220,9 +1250,11 @@ class MainWindow(QMainWindow):
         prepare_layout.addWidget(self.extract_check, 2, 1, 1, 2)
         prepare_layout.addWidget(self.decrypt_check, 3, 1, 1, 2)
         prepare_layout.addWidget(self.prepare_button, 4, 2)
-        prepare_layout.addWidget(self.progress_bar, 5, 1)
-        prepare_layout.addWidget(self.progress_label, 5, 2)
-        prepare_layout.addWidget(self.artifact_table, 6, 0, 1, 3)
+        prepare_layout.addWidget(make_form_label("Progress"), 5, 0)
+        prepare_layout.addWidget(self.progress_name_label, 5, 1, 1, 2)
+        prepare_layout.addWidget(self.progress_label, 6, 1, 1, 2)
+        prepare_layout.addWidget(self.progress_bar, 7, 1, 1, 2)
+        prepare_layout.addWidget(self.artifact_table, 8, 0, 1, 3)
         prepare_layout.setColumnStretch(1, 1)
         prepare_layout.setColumnStretch(2, 0)
         layout.addWidget(prepare_group)
@@ -1838,8 +1870,13 @@ class MainWindow(QMainWindow):
         if self._prepare_worker is not None and self._prepare_worker.isRunning():
             QMessageBox.information(self, "LRSA", "ROM preparation is already running.")
             return
+        self._progress_key = None
+        self._progress_started_at = 0.0
+        self._progress_started_current = 0
         self.progress_bar.setRange(0, 0)
-        self.progress_label.setText("Preparing ROM...")
+        self.progress_name_label.setText("Preparing ROM...")
+        self.progress_name_label.setToolTip("")
+        self.progress_label.setText("Waiting for progress...")
         self._prepare_worker = PrepareWorker(
             resource=resource,
             work_dir=self._work_dir(),
@@ -1854,25 +1891,63 @@ class MainWindow(QMainWindow):
         self._prepare_worker.start()
 
     @staticmethod
-    def _format_progress_amount(current: int, total: int, stage: str) -> str:
+    def _format_bytes(value: int | float) -> str:
+        amount = float(max(0, value))
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if amount < 1024 or unit == "TiB":
+                if unit == "B":
+                    return f"{int(amount)} {unit}"
+                return f"{amount:.1f} {unit}"
+            amount /= 1024
+        return f"{amount:.1f} TiB"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _format_progress_amount(self, current: int, total: int, stage: str) -> str:
         if stage == "download":
-
-            def format_bytes(value: int) -> str:
-                amount = float(max(0, value))
-                for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-                    if amount < 1024 or unit == "TiB":
-                        if unit == "B":
-                            return f"{int(amount)} {unit}"
-                        return f"{amount:.1f} {unit}"
-                    amount /= 1024
-                return f"{amount:.1f} TiB"
-
-            return f"{format_bytes(current)} / {format_bytes(total)}"
+            return f"{self._format_bytes(current)} / {self._format_bytes(total)}"
         return f"{current}/{total}"
+
+    def _progress_stats_text(
+        self, stage: str, current: int, total: int, elapsed: float
+    ) -> str:
+        percent = int(max(0, min(current, total)) * 100 / total)
+        amount = self._format_progress_amount(current, total, stage)
+        transferred = current - self._progress_started_current
+        speed = transferred / elapsed if elapsed >= PROGRESS_RATE_MIN_SECONDS else 0
+        if speed <= 0:
+            return f"{stage}: {percent}% | {amount} | elapsed {self._format_duration(elapsed)}"
+        remaining = max(0, total - current)
+        eta = remaining / speed
+        speed_text = (
+            f"{self._format_bytes(speed)}/s"
+            if stage == "download"
+            else f"{speed:.1f} items/s"
+        )
+        return (
+            f"{stage}: {percent}% | {amount} | "
+            f"elapsed {self._format_duration(elapsed)} | "
+            f"ETA {self._format_duration(eta)} | {speed_text}"
+        )
 
     def _update_prepare_progress(
         self, stage: str, current: int, total: object, label: str
     ) -> None:
+        self.progress_name_label.setText(label or stage)
+        self.progress_name_label.setToolTip(label)
+        key = (stage, label)
+        now = time.monotonic()
+        if key != self._progress_key:
+            self._progress_key = key
+            self._progress_started_at = now
+            self._progress_started_current = current
         if isinstance(total, int) and not isinstance(total, bool) and total > 0:
             bounded_current = max(0, min(current, total))
             if total <= PROGRESS_BAR_MAX:
@@ -1884,16 +1959,22 @@ class MainWindow(QMainWindow):
                     int(bounded_current * PROGRESS_BAR_MAX / total)
                 )
             self.progress_label.setText(
-                f"{stage}: {label} "
-                f"({self._format_progress_amount(current, total, stage)})"
+                self._progress_stats_text(
+                    stage,
+                    current,
+                    total,
+                    now - self._progress_started_at,
+                )
             )
         else:
             self.progress_bar.setRange(0, 0)
-            self.progress_label.setText(f"{stage}: {label}")
+            self.progress_label.setText(f"{stage}: waiting for size")
 
     def _prepare_failed(self, message: str) -> None:
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
+        self.progress_name_label.setText("ROM preparation failed")
+        self.progress_name_label.setToolTip("")
         self.progress_label.setText("Failed")
         self._append_log(f"ROM preparation failed: {message}")
         QMessageBox.warning(self, "ROM preparation failed", message)
@@ -1901,6 +1982,8 @@ class MainWindow(QMainWindow):
     def _prepare_finished(self, manifest: dict[str, Any]) -> None:
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
+        self.progress_name_label.setText("ROM preparation complete")
+        self.progress_name_label.setToolTip("")
         self.progress_label.setText("Done")
         self._populate_artifacts(manifest.get("resourceArtifacts"))
         for key, value in manifest.items():
